@@ -13,9 +13,11 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${HERE}/macbook.conf"
 PROGRAM="${HERE}/mbp-sleep"
+SOURCE_VERSION="$(cat "${HERE}/VERSION" 2>/dev/null || echo unknown)"
 
 BIN="/usr/local/sbin/mbp-sleep"
 CONF="/etc/mbp-sleep.conf"
+VERSION_FILE="/usr/local/share/mbp-sleep/VERSION"
 UNIT="/etc/systemd/system/mbp-sleep.service"
 HOOK="/usr/lib/systemd/system-sleep/50-mbp-sleep"
 SLEEP_DROPIN="/etc/systemd/system/systemd-suspend.service.d/10-no-freeze.conf"
@@ -65,7 +67,7 @@ save() {
 }
 
 echo
-echo "mbp-sleep installer"
+echo "mbp-sleep installer ${SOURCE_VERSION}"
 echo "-------------------"
 echo
 
@@ -75,6 +77,9 @@ echo
 save "$BIN"
 install -D -m 0755 "$PROGRAM" "$BIN" || fail "cannot install $BIN"
 info "installed $BIN"
+save "$VERSION_FILE"
+install -D -m 0644 "$HERE/VERSION" "$VERSION_FILE" || fail "cannot install $VERSION_FILE"
+info "installed $VERSION_FILE ($SOURCE_VERSION)"
 
 if [[ -r "$CONF" ]]; then
 	info "kept the existing $CONF (not overwritten)"
@@ -223,6 +228,7 @@ sleep 1
 # 7. verify
 # ---------------------------------------------------------------------------
 echo "verification"
+info "version        : $("$BIN" --version 2>/dev/null)"
 info "service        : $(systemctl is-active mbp-sleep.service 2>/dev/null) / $(systemctl is-enabled mbp-sleep.service 2>/dev/null)"
 info "hook           : $(ls /usr/lib/systemd/system-sleep/ | tr '\n' ' ')"
 info "freeze drop-in : $([[ -e $SLEEP_DROPIN ]] && echo present || echo absent)"

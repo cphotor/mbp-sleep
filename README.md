@@ -73,6 +73,7 @@ It installs:
 | path | what |
 |---|---|
 | `/usr/local/sbin/mbp-sleep` | the program |
+| `/usr/local/share/mbp-sleep/VERSION` | the version, copied from `VERSION` in this repository |
 | `/etc/systemd/system/mbp-sleep.service` | the daemon (wake sources, lid, backup lock) |
 | `/usr/lib/systemd/system-sleep/50-mbp-sleep` | the sleep hook (this systemd reads only `/usr/lib/...`) |
 | `/etc/systemd/logind.conf.d/50-mbp-sleep.conf` | logind ignores the lid, so this program handles it |
@@ -84,6 +85,10 @@ Anything it replaces is copied to `/var/backups/mbp-sleep/<timestamp>/` with a
 `manifest.tsv`, so `uninstall.sh` can put it back. An existing
 `/etc/mbp-sleep.conf` is **never overwritten**; if the shipped defaults have
 gained a switch, the installer prints which ones are missing.
+
+The version has one source: the `VERSION` file in this repository.
+`install.sh` copies it, `mbp-sleep --version` reads it, and a release is the
+tag `v$(cat VERSION)`.
 
 ## Check that it works
 
@@ -193,6 +198,7 @@ itself. To suspend immediately, stop the lock: `sudo systemctl stop mbp-sleep`.
 | `mbp-sleep report --boot N` | the four questions, for every cycle in boot `N` (`-1` = previous boot) |
 | `mbp-sleep cifs-reconnect` | wait for the network and remount the shares taken down before sleep |
 | `mbp-sleep wake` | re-apply the wake sources |
+| `mbp-sleep --version` | print the version from `VERSION` |
 | `mbp-sleep pre` / `post` | what the sleep hook calls; not for interactive use |
 
 Run them with `sudo` when they need `/sys`, `/proc/acpi/wakeup` or the mount

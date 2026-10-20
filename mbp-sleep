@@ -45,6 +45,24 @@ TAG = "mbp-sleep"
 DEFAULT_CONF = "/etc/mbp-sleep.conf"
 RUN_DIR = Path("/run/mbp-sleep")
 WAKEUP = "/proc/acpi/wakeup"
+INSTALLED_VERSION = Path("/usr/local/share/mbp-sleep/VERSION")
+
+
+def version() -> str:
+    """The single version source is the VERSION file, next to this script.
+
+    In the repository that is `./VERSION`; `install.sh` copies it to
+    `/usr/local/share/mbp-sleep/VERSION` for the installed program.
+    """
+    for candidate in (Path(__file__).resolve().with_name("VERSION"),
+                      INSTALLED_VERSION):
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            return text
+    return "unknown"
 
 # Compiled-in defaults.  The configuration file only overrides these, so a
 # missing or truncated file still gives a working, fully-enabled machine.
@@ -1076,6 +1094,8 @@ def cmd_report(cfg: Config, boot: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mbp-sleep", description=__doc__)
     parser.add_argument("--conf", default=DEFAULT_CONF)
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {version()}")
     parser.add_argument("command", choices=[
         "daemon", "pre", "post", "status", "report", "dry-run", "wifi-verify",
         "cifs-reconnect", "wake", "detach", "restore",

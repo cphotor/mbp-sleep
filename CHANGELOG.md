@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-20
+
+### Fixed
+
+- **The post-resume helpers were killed with the sleep unit.** The CIFS
+  reconnect ran as a plain detached child, still inside
+  `systemd-suspend.service`; `KillMode=control-group` killed it when the hook
+  returned, so a share stayed unmounted until something else touched it. The
+  reconnect and the Wi-Fi check now run as their own transient units
+  (`systemd-run --collect --no-block`). Verified on a real sleep: S3 573.422 s,
+  the helper survived, retried while the network came back, and remounted the
+  share.
+
+### Added
+
+- `VERSION` is the single source of the project version. `mbp-sleep --version`
+  prints it, `install.sh` installs it, and a release is the tag
+  `v$(cat VERSION)`.
+
 ## [0.1.0] - 2026-10-20
 
 First release.
