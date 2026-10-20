@@ -1,0 +1,7 @@
+# Diagnostic output produced by scripts/diagnose.sh or scripts/test-suspend.sh.
+# These are per-machine and must not be committed.
+*.log
+diagnose-*.txt
+
+# Python bytecode from mbp-sleep.
+__pycache__/

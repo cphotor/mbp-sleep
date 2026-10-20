@@ -1,0 +1,1095 @@
+#!/usr/bin/env python3
+"""mbp-sleep -- the only program this machine uses to manage suspend and resume.
+
+It is installed to /usr/local/sbin/mbp-sleep and has two entry points:
+
+  * the daemon, started by mbp-sleep.service at boot.  It re-arms the ACPI wake
+    sources, takes over the lid switch, and holds a logind block lock while a
+    backup is running so a suspend request cannot interrupt the backup.
+
+  * `pre` and `post`, called by the systemd-sleep hook
+    /usr/lib/systemd/system-sleep/50-mbp-sleep.  These do the device work
+    around a sleep: detach the Thunderbolt Ethernet endpoint and the Wi-Fi,
+    unmount the CIFS shares, and put all three back afterwards.
+
+Anything that can fail is logged and swallowed.  Nothing here is allowed to
+abort a sleep transaction, because a machine that refuses to sleep is worse than
+one that sleeps imperfectly.
+
+Design notes that are easy to get wrong again:
+
+  * The Wi-Fi must be disconnected before the driver is unloaded.  Unloading it
+    while wpa_supplicant still holds the interface leaves the process in state D
+    and the suspend never happens ("The brcmfmac trap").
+  * `post` must not wait for NetworkManager.  logind only tells NetworkManager
+    to come back after systemd-sleep returns, i.e. after this hook.  The
+    verification therefore runs detached, in `wifi-verify`.
+  * /proc/acpi/wakeup is a toggle, not a setter.  Read first, write only on a
+    real change, or a second write silently disables the source again.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+TAG = "mbp-sleep"
+DEFAULT_CONF = "/etc/mbp-sleep.conf"
+RUN_DIR = Path("/run/mbp-sleep")
+WAKEUP = "/proc/acpi/wakeup"
+
+# Compiled-in defaults.  The configuration file only overrides these, so a
+# missing or truncated file still gives a working, fully-enabled machine.
+DEFAULTS = {
+    "wake_sources": "on",
+    "wake_devices": "SPIT XHC1 LID0",
+    "wifi_detach": "on",
+    "wifi_interface": "wlan0",
+    "wifi_modules": "brcmfmac_wcc brcmfmac",
+    "wifi_restore_wait": "20",
+    "thunderbolt_eject": "on",
+    "thunderbolt_name": "Thunderbolt to Gigabit Ethernet Adapter",
+    "thunderbolt_settle": "2",
+    "cifs_unmount": "on",
+    "cifs_auto": "on",
+    "network_fstypes": "cifs smb3 nfs nfs4 fuse.sshfs",
+    "cifs_shares": "",                  # only used when cifs_auto is off
+    "cifs_root": "/mnt",
+    "cifs_umount_wait": "15",
+    "cifs_reconnect_wait": "120",
+    "defer_on_backup": "on",
+    "backup_names": "borg",
+    "defer_max_wait": "3600",
+    "silence_force_prompt": "on",
+    "lid_watch": "on",
+    "lid_state": "/proc/acpi/button/lid/LID0/state",
+    "freeze_sessions": "off",
+}
+
+
+# --------------------------------------------------------------------------
+# configuration and logging
+# --------------------------------------------------------------------------
+
+class Config(dict):
+    """key = value, with the compiled-in defaults underneath."""
+
+    def __init__(self, path: str = DEFAULT_CONF):
+        super().__init__(DEFAULTS)
+        self.path = path
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            return
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            self[key.strip()] = value.strip()
+
+    def on(self, key: str) -> bool:
+        return str(self.get(key, "off")).strip().lower() in ("on", "yes", "true", "1")
+
+    def num(self, key: str, default: int = 0) -> int:
+        try:
+            return int(str(self.get(key, default)).strip())
+        except ValueError:
+            return default
+
+    def words(self, key: str) -> list[str]:
+        return [w for w in str(self.get(key, "")).split() if w]
+
+
+def log(message: str) -> None:
+    print(f"[{TAG}] {message}", flush=True)
+
+
+def run(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Run a command, never raise, always return something with .returncode."""
+    try:
+        return subprocess.run(
+            argv, timeout=timeout, capture_output=True, text=True, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout}s")
+    except (OSError, ValueError) as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
+
+
+def have(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+# --------------------------------------------------------------------------
+# 1. ACPI wake sources
+# --------------------------------------------------------------------------
+
+def read_wakeup() -> dict[str, bool]:
+    """device name -> enabled?  Reads /proc/acpi/wakeup once."""
+    state: dict[str, bool] = {}
+    try:
+        text = Path(WAKEUP).read_text()
+    except OSError:
+        return state
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[0] == "Device":
+            continue
+        state[fields[0]] = "*enabled" in fields[2]
+    return state
+
+
+def apply_wake_sources(cfg: Config) -> None:
+    wanted = cfg.words("wake_devices")
+    current = read_wakeup()
+    for device in wanted:
+        if device not in current:
+            log(f"wake: {device} is not in {WAKEUP}, cannot enable")
+            continue
+        if current[device]:
+            continue
+        # Writing the name toggles the source.  We only write when it is
+        # actually disabled, so this is a set, not a blind toggle.
+        try:
+            Path(WAKEUP).write_text(device + "\n")
+        except OSError as exc:
+            log(f"wake: could not enable {device}: {exc}")
+            continue
+        after = read_wakeup().get(device)
+        log(f"wake: {device} -> {'enabled' if after else 'still disabled'}")
+
+
+# --------------------------------------------------------------------------
+# 2. Wi-Fi
+# --------------------------------------------------------------------------
+
+def wifi_present(cfg: Config) -> bool:
+    return Path(f"/sys/class/net/{cfg['wifi_interface']}").exists()
+
+
+def wifi_connected(cfg: Config) -> bool:
+    if not have("nmcli"):
+        return wifi_present(cfg)
+    out = run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"], timeout=10).stdout
+    for line in out.splitlines():
+        device, _, state = line.partition(":")
+        if device == cfg["wifi_interface"]:
+            return state == "connected"
+    return False
+
+
+def wifi_detach(cfg: Config) -> None:
+    iface = cfg["wifi_interface"]
+    # Step 1: let wpa_supplicant release the interface.  Skipping this is what
+    # left wpa_supplicant in state D in the earlier attempt.
+    if wifi_present(cfg) and have("nmcli"):
+        result = run(["nmcli", "device", "disconnect", iface], timeout=10)
+        log(f"wifi: disconnect {iface} rc={result.returncode}")
+    else:
+        log(f"wifi: {iface} not present, nothing to disconnect")
+
+    # Step 2: unload, in the order the configuration lists them: the container
+    # module `brcmfmac_wcc` must go first, or the kernel refuses to remove
+    # `brcmfmac` with "Module brcmfmac is in use".  (The first version of this
+    # reversed the list and produced exactly that error on 2026-10-20 16:09.)
+    for module in cfg.words("wifi_modules"):
+        result = run(["modprobe", "-r", module], timeout=15)
+        if result.returncode == 0:
+            log(f"wifi: unloaded {module}")
+        else:
+            log(f"wifi: could not unload {module}: {result.stderr.strip()[:120]}")
+
+
+def wifi_restore(cfg: Config, wait: int | None = None) -> bool:
+    modules = cfg.words("wifi_modules")
+    driver = modules[-1] if modules else "brcmfmac"
+    result = run(["modprobe", driver], timeout=20)
+    if result.returncode != 0:
+        log(f"wifi: modprobe {driver} failed: {result.stderr.strip()[:120]}")
+        return False
+    log(f"wifi: loaded {driver}")
+
+    deadline = time.monotonic() + (cfg.num("wifi_restore_wait", 20) if wait is None else wait)
+    while time.monotonic() < deadline:
+        if wifi_connected(cfg):
+            log(f"wifi: {cfg['wifi_interface']} is connected")
+            return True
+        time.sleep(1)
+    log(f"wifi: {cfg['wifi_interface']} did not come back within the wait")
+    return False
+
+
+def wifi_verify(cfg: Config) -> None:
+    """Runs detached after resume: waits for NetworkManager, reloads once if the
+    interface never appears.  This is the old brcmfmac-resume-recover.service,
+    folded in."""
+    if wifi_restore(cfg):
+        return
+    log("wifi: reloading once more")
+    for module in cfg.words("wifi_modules"):
+        run(["modprobe", "-r", module], timeout=15)
+    if wifi_restore(cfg, wait=cfg.num("wifi_restore_wait", 20)):
+        log("wifi: recovered on the second attempt")
+    else:
+        log("wifi: still not connected; leaving it to NetworkManager")
+
+
+# --------------------------------------------------------------------------
+# 3. Thunderbolt Ethernet endpoint
+# --------------------------------------------------------------------------
+
+def thunderbolt_endpoints(cfg: Config) -> list[Path]:
+    found: list[Path] = []
+    root = Path("/sys/bus/thunderbolt/devices")
+    if not root.is_dir():
+        return found
+    needle = cfg["thunderbolt_name"]
+    for entry in sorted(root.iterdir()):
+        # 0-0 is the host controller.  Deauthorising it takes the whole
+        # Thunderbolt router away; the published script that inspired C5 got
+        # this wrong and it is the one thing we must not copy.
+        if entry.name == "0-0":
+            continue
+        try:
+            name = (entry / "device_name").read_text().strip()
+        except OSError:
+            continue
+        if needle in name:
+            found.append(entry)
+    return found
+
+
+def thunderbolt_set(cfg: Config, authorized: bool) -> None:
+    endpoints = thunderbolt_endpoints(cfg)
+    if not endpoints:
+        log("thunderbolt: adapter not enumerated, nothing to do")
+        return
+    for endpoint in endpoints:
+        try:
+            (endpoint / "authorized").write_text("1" if authorized else "0")
+            log(f"thunderbolt: {endpoint.name} authorized={'1' if authorized else '0'}")
+        except OSError as exc:
+            log(f"thunderbolt: {endpoint.name} failed: {exc}")
+
+
+# --------------------------------------------------------------------------
+# 4. CIFS shares
+# --------------------------------------------------------------------------
+
+def cifs_path(cfg: Config, share: str) -> str:
+    return f"{cfg['cifs_root'].rstrip('/')}/{share}"
+
+
+# Paths this program took down before sleeping, remembered across the sleep so
+# the resume half can put exactly those back.  /run survives a suspend and is
+# cleared by a reboot, which is the right lifetime.
+NETWORK_UNMOUNTED = RUN_DIR / "network-unmounted"
+
+DEFAULT_NETWORK_FSTYPES = "cifs smb3 nfs nfs4 fuse.sshfs"
+
+
+def network_fstypes(cfg: Config) -> set[str]:
+    return set(cfg.words("network_fstypes")) or set(DEFAULT_NETWORK_FSTYPES.split())
+
+
+def mount_table() -> dict[str, str]:
+    """mount point -> filesystem type, from /proc/mounts.
+
+    The distinction matters and is easy to get wrong: three of this machine's
+    four shares are `x-systemd.automount`, so their mount point exists and
+    `os.path.ismount()` is true while nothing is actually mounted on it -- it is
+    an autofs trampoline.  Unmounting that would tear down the automount unit
+    and change how the share comes back, which is not what a sleep hook should
+    do.  Only a real `cifs` mount is ours to unmount.
+    """
+    table: dict[str, str] = {}
+    try:
+        lines = Path("/proc/mounts").read_text().splitlines()
+    except OSError:
+        return table
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        table[parts[1].replace("\\040", " ")] = parts[2]
+    return table
+
+
+def mount_unit(path: str) -> str:
+    # systemd escapes `/mnt/share` to `mnt-share.mount`: the leading slash
+    # becomes nothing, every other slash becomes a dash.
+    return path.strip("/").replace("/", "-") + ".mount"
+
+
+def cifs_targets(cfg: Config) -> list[str]:
+    """The mount points to take down before sleeping.
+
+    With `cifs_auto` on — the default — the answer is **discovered**: every
+    mount in /proc/mounts whose filesystem type is a network filesystem.  No
+    share name of this machine is compiled in, so the same program does the
+    right thing on a machine with other shares, with NFS instead of SMB, or with
+    none at all.  `cifs_shares` is only consulted when discovery is turned off,
+    which is what an older configuration file expresses.
+
+    An idle `x-systemd.automount` share does not appear here at all: its mount
+    point carries `autofs`, not `cifs`, and touching it would tear down the
+    automount unit rather than a mount.
+    """
+    if not cfg.on("cifs_auto"):
+        return [cifs_path(cfg, share) for share in cfg.words("cifs_shares")]
+    fstypes = network_fstypes(cfg)
+    return sorted(path for path, fstype in mount_table().items()
+                  if fstype in fstypes)
+
+
+def cifs_remember(paths: list[str]) -> None:
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        NETWORK_UNMOUNTED.write_text("".join(path + "\n" for path in paths))
+    except OSError as exc:
+        log(f"cifs: cannot remember the unmounted shares: {exc}")
+
+
+def cifs_remembered() -> list[str]:
+    try:
+        return [line.strip() for line in NETWORK_UNMOUNTED.read_text().splitlines()
+                if line.strip()]
+    except OSError:
+        return []
+
+
+def cifs_forget() -> None:
+    try:
+        NETWORK_UNMOUNTED.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def cifs_unmount(cfg: Config) -> None:
+    table = mount_table()
+    fstypes = network_fstypes(cfg)
+    unmounted: list[str] = []
+    for path in cifs_targets(cfg):
+        fstype = table.get(path)
+        if fstype not in fstypes:
+            log(f"cifs: {path} is {fstype or 'not mounted'}, nothing to unmount")
+            continue
+        result = run(["umount", path], timeout=cfg.num("cifs_umount_wait", 15))
+        if result.returncode == 0:
+            unmounted.append(path)
+            log(f"cifs: unmounted {path} ({fstype})")
+        else:
+            # Never lazy-unmount: that leaves the superblock behind, which is
+            # exactly what the kernel then has to sync over a dead link.
+            log(f"cifs: could not unmount {path} rc={result.returncode} "
+                f"{(result.stderr or result.stdout).strip()[:100]}")
+    if unmounted:
+        cifs_remember(unmounted)
+
+
+def cifs_mount(cfg: Config) -> None:
+    table = mount_table()
+    fstypes = network_fstypes(cfg)
+    for path in cifs_remembered() or cifs_targets(cfg):
+        fstype = table.get(path)
+        if fstype in fstypes:
+            continue
+        if fstype == "autofs":
+            # Left alone on purpose: the automount unit remounts the share the
+            # next time something touches the directory.
+            continue
+        unit = mount_unit(path)
+        result = run(["systemctl", "start", unit], timeout=30)
+        if result.returncode == 0:
+            log(f"cifs: started {unit}")
+        elif run(["mount", path], timeout=30).returncode == 0:
+            log(f"cifs: mounted {path}")
+        else:
+            log(f"cifs: {path} not remounted; it will come back on next access")
+
+
+def cifs_satisfied(cfg: Config) -> bool:
+    table = mount_table()
+    fstypes = network_fstypes(cfg)
+    paths = cifs_remembered() or cifs_targets(cfg)
+    return all(table.get(path) in fstypes or table.get(path) == "autofs"
+               for path in paths)
+
+
+def cifs_reconnect(cfg: Config) -> None:
+    """Wait for the network to come back, then remount the shares.
+
+    `post` cannot do this itself.  logind only tells NetworkManager to come back
+    *after* systemd-sleep returns, so a mount attempt inside the hook runs while
+    there is still no network to mount over.  Measured on 2026-10-20: the mount
+    was tried 1 s after the Wi-Fi driver was reloaded, failed, and the share
+    stayed down until somebody noticed.
+    """
+    deadline = time.monotonic() + cfg.num("cifs_reconnect_wait", 120)
+    delay = 3
+    while time.monotonic() < deadline:
+        if cifs_satisfied(cfg):
+            cifs_forget()
+            log("cifs: all shares are back")
+            return
+        cifs_mount(cfg)
+        if cifs_satisfied(cfg):
+            cifs_forget()
+            log("cifs: all shares are back")
+            return
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+    log(f"cifs: gave up after {cfg.num('cifs_reconnect_wait', 120)} s; "
+        f"the shares will come back when something touches them")
+
+
+# --------------------------------------------------------------------------
+# 5. Backup detection and the logind block lock
+# --------------------------------------------------------------------------
+
+def backup_running(cfg: Config) -> bool:
+    """Is a backup actually running?
+
+    The question is answered from `argv`, not from a regex over the joined
+    command line.  A regex was the first implementation and it was too eager: a
+    shell command that merely *mentions* borg in its text — a grep, a diagnostic
+    one-liner — matched it and made the machine think a backup was running.
+
+    What counts is the process itself: `borg` as argv[0], or argv[1] behind the
+    interpreter a `#!/usr/bin/python3` shebang produces.  That is what
+    `/usr/bin/borg create ...` looks like in `/proc/<pid>/cmdline`.
+    """
+    names = set(cfg.words("backup_names")) or {"borg"}
+    literal = next(iter(sorted(names, key=len))).encode()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            descriptor = os.open(f"/proc/{name}/cmdline", os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            raw = os.read(descriptor, 4096)
+        except OSError:
+            raw = b""
+        finally:
+            os.close(descriptor)
+        if not raw or literal not in raw:
+            continue
+        argv = raw.split(b"\0")
+        if not argv or not argv[0]:
+            continue
+        first = os.path.basename(argv[0]).decode("utf-8", "replace")
+        if first in names:
+            return True
+        if (first.startswith("python") or first in ("env", "perl", "bash", "sh")) \
+                and len(argv) > 1:
+            if os.path.basename(argv[1]).decode("utf-8", "replace") in names:
+                return True
+    return False
+
+
+# -- the desktop's "force it anyway" prompt ----------------------------------
+# While a backup runs, this program holds a logind block lock, so a suspend
+# requested from the desktop waits for the backup.  With a block inhibitor
+# present, a desktop request also makes polkit offer the password that would
+# *force* the suspend past the lock (action
+# org.freedesktop.login1.suspend-ignore-inhibit).  That prompt is noise and was
+# mistaken for a fault on 2026-10-20 16:55: the request is already remembered
+# and re-issued when the backup ends.
+#
+# The rule below is generated from `silence_force_prompt` in the configuration
+# file, so the behaviour is a setting like every other one.  polkitd watches
+# rules.d and reloads by itself, so writing the file is the whole install.
+POLICY_FILE = Path("/etc/polkit-1/rules.d/49-mbp-sleep-no-force-suspend.rules")
+POLICY_MARK = "generated by mbp-sleep"
+
+POLICY_BODY = """\
+/* {mark} from {conf} -- do not edit this file.
+ *
+ * Change `silence_force_prompt` in {conf} and restart mbp-sleep.service
+ * instead.  Denying org.freedesktop.login1.suspend-ignore-inhibit removes the
+ * desktop password prompt that would force a suspend past the block lock held
+ * while a backup runs.  The suspend request itself is not lost: mbp-sleep
+ * remembers it and re-issues it when the backup ends.
+ *
+ * To force a suspend anyway, release the lock first:
+ *     systemctl stop mbp-sleep
+ *
+ * No `subject` condition on purpose: with a UnixProcess subject (`pkcheck
+ * --process`) `subject.local` came back unset and the rule was skipped
+ * entirely, so the action kept its default `auth_admin_keep` and the prompt
+ * stayed.  Measured 2026-10-20 17:39.  Matching on the action alone works, and
+ * on this machine the action has exactly one meaning.
+ */
+polkit.addRule(function (action) {{
+    if (action.id == "org.freedesktop.login1.suspend-ignore-inhibit") {{
+        return polkit.Result.NO;
+    }}
+}});
+"""
+
+
+def policy_present() -> bool:
+    """True when the generated polkit rule is in place."""
+    try:
+        return POLICY_FILE.exists() and POLICY_MARK in POLICY_FILE.read_text()
+    except OSError:
+        return False
+
+
+def reload_polkit() -> None:
+    """Make polkitd read the rules directory again.
+
+    polkitd watches its rules directories with inotify, but it only watches the
+    directories that existed when it started.  `/etc/polkit-1/rules.d` did not
+    exist on this machine before this project created it, so a written rule was
+    invisible until polkitd was poked (measured 2026-10-20 17:31: `pkcheck`
+    still answered `auth_admin_keep`).  A reload is cheap and unconditional.
+    """
+    for command in (["systemctl", "reload", "polkit"],
+                    ["systemctl", "try-reload-or-restart", "polkit"]):
+        result = run(command, timeout=15)
+        if result.returncode == 0:
+            return
+    log("policy: polkit did not reload; the rule applies from the next boot")
+
+
+def apply_force_prompt_policy(cfg: Config) -> None:
+    """Make the generated polkit rule agree with `silence_force_prompt`."""
+    try:
+        if cfg.on("silence_force_prompt"):
+            body = POLICY_BODY.format(mark=POLICY_MARK, conf=DEFAULT_CONF)
+            if POLICY_FILE.exists() and POLICY_FILE.read_text() == body:
+                return
+            if POLICY_FILE.exists() and POLICY_MARK not in POLICY_FILE.read_text():
+                # Someone else's rule; never overwrite what we did not write.
+                log(f"policy: {POLICY_FILE} exists and is not ours; leaving it")
+                return
+            POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            POLICY_FILE.write_text(body)
+            POLICY_FILE.chmod(0o644)
+            reload_polkit()
+            log(f"policy: {POLICY_FILE.name} written; the desktop will not "
+                f"offer to force a suspend past the backup lock")
+        elif POLICY_FILE.exists() and POLICY_MARK in POLICY_FILE.read_text():
+            POLICY_FILE.unlink()
+            reload_polkit()
+            log(f"policy: {POLICY_FILE.name} removed; the desktop offers the "
+                f"force prompt again")
+    except OSError as exc:
+        log(f"policy: cannot update {POLICY_FILE}: {exc}")
+
+
+class Inhibitor:
+    """A logind lock held by a child `systemd-inhibit` process.
+
+    Using the command rather than the D-Bus Inhibit() method avoids having to
+    unwrap a file descriptor through Gio, which is the part that goes wrong in
+    Python.
+    """
+
+    def __init__(self, what: str, mode: str, why: str):
+        self.process: subprocess.Popen | None = None
+        self.what, self.mode, self.why = what, mode, why
+
+    def acquire(self) -> bool:
+        if self.process and self.process.poll() is None:
+            return True
+        self.process = subprocess.Popen(
+            ["systemd-inhibit", f"--what={self.what}", f"--mode={self.mode}",
+             f"--who={TAG}", f"--why={self.why}", "sleep", "infinity"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        # Give it a moment to register, so `status` right after is truthful.
+        time.sleep(0.4)
+        alive = self.process.poll() is None
+        log(f"lock: {self.mode} on {self.what} "
+            f"{'held' if alive else 'FAILED to be taken'}")
+        return alive
+
+    def release(self) -> None:
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+            log(f"lock: {self.mode} on {self.what} released")
+        self.process = None
+
+    @property
+    def held(self) -> bool:
+        return bool(self.process and self.process.poll() is None)
+
+
+# --------------------------------------------------------------------------
+# 6. The daemon
+# --------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.block = Inhibitor("sleep", "block", "a backup is running")
+        self.lid_closed = False
+        self.pending = False
+        self.pending_since = 0.0
+        self.lock_since = 0.0
+        self.gave_up = False
+        self.self_initiated_until = 0.0
+        # Scanning /proc costs ~7.6 ms on this machine (450 processes), which is
+        # 0.8% CPU once a second for nothing.  The lid and the bus both force a
+        # fresh scan when it matters, so the background poll can be lazy.
+        self.backup_seen = False
+        self.backup_checked = 0.0
+        self.watcher_thread: threading.Thread | None = None
+        self.watcher_process: subprocess.Popen | None = None
+        self.watch_stop = threading.Event()
+        # The watcher is only alive while a block lock is held, so fetching it
+        # again later is expected, not a leak.
+        self.watch_stop.set()
+
+    def backup_state(self, max_age: float = 2.0) -> bool:
+        now = time.monotonic()
+        if now - self.backup_checked >= max_age:
+            self.backup_checked = now
+            self.backup_seen = backup_running(self.cfg)
+        return self.backup_seen
+
+    # -- suspend requests ---------------------------------------------------
+    def suspend_now(self, reason: str) -> None:
+        log(f"suspend: requesting now ({reason})")
+        self.pending = False
+        self.self_initiated_until = time.monotonic() + 15
+        run(["systemctl", "suspend"], timeout=15)
+
+    def request(self, reason: str) -> None:
+        # A fresh scan: this is the moment the answer decides whether a backup
+        # survives, so never answer from a cached value here.
+        self.backup_state(max_age=0.0)
+        if self.deferring:
+            log(f"suspend: deferred until the backup ends ({reason})")
+            if not self.pending:
+                self.pending = True
+                self.pending_since = time.monotonic()
+        else:
+            self.suspend_now(reason)
+
+    @property
+    def deferring(self) -> bool:
+        return self.cfg.on("defer_on_backup") and self.block.held
+
+    # -- menu and other D-Bus requests -------------------------------------
+    def start_watcher(self) -> None:
+        """Watch the bus for `Suspend` calls, only while a block lock is held.
+
+        With the lock held, logind refuses the request and logs nothing we can
+        hear; the call itself on the bus is the only evidence, and that is how a
+        request made from the desktop menu gets remembered and re-issued later.
+
+        The watcher is not left running all the time on purpose: a monitor
+        connection receives *every* message on the system bus, and reading that
+        stream cost this machine 1% of a core for no reason while nothing is
+        being refused.
+        """
+        if self.watcher_thread and self.watcher_thread.is_alive():
+            return
+        if not have("dbus-monitor"):
+            log("watch: dbus-monitor missing, menu suspend cannot be deferred")
+            return
+        self.watch_stop.clear()
+        self.watcher_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self.watcher_thread.start()
+
+    def stop_watcher(self) -> None:
+        self.watch_stop.set()
+        process = self.watcher_process
+        if process and process.poll() is None:
+            process.terminate()
+        if self.watcher_thread:
+            self.watcher_thread.join(timeout=3)
+        self.watcher_thread = None
+        self.watcher_process = None
+
+    def _watch_loop(self) -> None:
+        command = [
+            "dbus-monitor", "--system",
+            "type='method_call',interface='org.freedesktop.login1.Manager'",
+        ]
+        # Deliberately *not* filtered by member on the bus: a D-Bus match rule
+        # compares the member exactly, and this machine's suspend key goes
+        # through `SuspendWithFlags`, not `Suspend` (the string is in
+        # /usr/lib/gsd-media-keys).  A `member='Suspend'` filter therefore
+        # received nothing at all on 2026-10-20 16:55 and the request was lost.
+        # `member=Suspend` as a *prefix* covers Suspend, SuspendWithFlags,
+        # SuspendThenHibernate and their WithFlags variants.
+        needle = b"member=Suspend"
+        while not self.watch_stop.is_set():
+            try:
+                process = subprocess.Popen(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+            except OSError as exc:
+                log(f"watch: cannot start dbus-monitor: {exc}")
+                return
+            self.watcher_process = process
+            tail = b""
+            while process.stdout is not None:
+                try:
+                    chunk = process.stdout.read1(65536)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break
+                # The needle could straddle two chunks; keep the last few bytes.
+                window = tail + chunk
+                if needle in window and time.monotonic() >= self.self_initiated_until:
+                    self.request("asked on the bus")
+                tail = window[-32:]
+            process.wait()
+            if not self.watch_stop.is_set():
+                time.sleep(2)         # dbus-monitor died; restart and retry
+
+    # -- lid ----------------------------------------------------------------
+    def lid_is_closed(self) -> bool:
+        try:
+            return "closed" in Path(self.cfg["lid_state"]).read_text()
+        except OSError:
+            return self.lid_closed
+
+    # -- main loop ----------------------------------------------------------
+    def tick(self) -> None:
+        if self.cfg.on("defer_on_backup"):
+            running = self.backup_state()
+            if running and not self.block.held and not self.gave_up:
+                if self.block.acquire():
+                    self.lock_since = time.monotonic()
+                    (RUN_DIR / "deferring").touch()
+                    self.start_watcher()
+            elif not running and self.block.held:
+                self.stop_watcher()
+                self.block.release()
+                (RUN_DIR / "deferring").unlink(missing_ok=True)
+                self.gave_up = False
+                if self.pending:
+                    self.suspend_now("the backup finished")
+            elif not running:
+                self.gave_up = False
+
+            # Safety valve: a block lock that is never released is a machine
+            # that can never sleep again, which is the failure this project
+            # exists to remove.  A backup that outlives defer_max_wait is
+            # treated as hung and the machine is given back.
+            if self.block.held and self.cfg.num("defer_max_wait", 3600) > 0:
+                held = time.monotonic() - self.lock_since
+                if held > self.cfg.num("defer_max_wait", 3600):
+                    log(f"lock: held for {held:.0f}s, the backup is taking too "
+                        f"long; releasing the machine")
+                    self.gave_up = True
+                    self.stop_watcher()
+                    self.block.release()
+                    (RUN_DIR / "deferring").unlink(missing_ok=True)
+            # safety valve: never hold the machine awake forever
+            if self.pending and self.cfg.num("defer_max_wait", 3600) > 0:
+                if time.monotonic() - self.pending_since > self.cfg.num("defer_max_wait", 3600):
+                    log("suspend: waited long enough, giving up on the backup")
+                    self.pending = False
+
+        if self.cfg.on("lid_watch"):
+            closed = self.lid_is_closed()
+            if closed and not self.lid_closed:
+                self.request("lid closed")
+            elif not closed and self.lid_closed:
+                if self.pending:
+                    log("suspend: lid reopened, the pending request is cancelled")
+                self.pending = False
+            self.lid_closed = closed
+
+    def run(self) -> int:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        (RUN_DIR / "daemon.pid").write_text(str(os.getpid()))
+
+        def bye(signum, _frame):
+            log(f"stopping on signal {signum}")
+            self.stop_watcher()
+            self.block.release()
+            (RUN_DIR / "daemon.pid").unlink(missing_ok=True)
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, bye)
+        signal.signal(signal.SIGINT, bye)
+
+        if self.cfg.on("wake_sources"):
+            apply_wake_sources(self.cfg)
+        apply_force_prompt_policy(self.cfg)
+
+        self.lid_closed = self.lid_is_closed()
+        log(f"started; lid is {'closed' if self.lid_closed else 'open'}; "
+            f"defer_on_backup={'on' if self.cfg.on('defer_on_backup') else 'off'}")
+
+        # No watcher at startup: it is started when a block lock is taken (see
+        # tick), because that is the only time a refused suspend can happen.
+        self.backup_state(max_age=0.0)
+
+        while True:
+            try:
+                self.tick()
+            except Exception as exc:                      # never die on a tick
+                log(f"tick failed: {exc!r}")
+            time.sleep(1)
+
+
+# --------------------------------------------------------------------------
+# 7. pre / post
+# --------------------------------------------------------------------------
+
+def do_pre(cfg: Config, dry: bool = False) -> None:
+    steps: list[tuple[str, callable]] = []
+    # Order is deliberate.  The CIFS shares may be reached over the Thunderbolt
+    # adapter, so they are unmounted before that adapter leaves the bus; and the
+    # Wi-Fi is detached last, after everything that might still need the network
+    # is done with it.
+    if cfg.on("cifs_unmount"):
+        steps.append(("cifs unmount", lambda: cifs_unmount(cfg)))
+    if cfg.on("thunderbolt_eject"):
+        steps.append(("thunderbolt deauthorise", lambda: thunderbolt_set(cfg, False)))
+    if cfg.on("wifi_detach"):
+        steps.append(("wifi detach", lambda: wifi_detach(cfg)))
+    for name, action in steps:
+        if dry:
+            log(f"would: {name}")
+            continue
+        started = time.monotonic()
+        action()
+        log(f"{name} took {time.monotonic() - started:.2f}s")
+
+
+def do_post(cfg: Config, dry: bool = False) -> None:
+    order: list[tuple[str, callable]] = []
+    if cfg.on("wifi_detach"):
+        # Detached: NetworkManager is only told to come back after this hook
+        # returns, so waiting for it here would always time out.
+        order.append(("wifi restore", lambda: subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--conf", cfg.path, "wifi-verify"],
+            stdout=sys.stdout, stderr=sys.stderr, start_new_session=True)))
+    if cfg.on("thunderbolt_eject"):
+        order.append(("thunderbolt reauthorise", lambda: (
+            time.sleep(cfg.num("thunderbolt_settle", 2)),
+            thunderbolt_set(cfg, True))))
+    if cfg.on("cifs_unmount"):
+        # Detached for the same reason as the Wi-Fi: the network is not back
+        # yet when this hook runs.
+        order.append(("cifs reconnect", lambda: subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--conf", cfg.path, "cifs-reconnect"],
+            stdout=sys.stdout, stderr=sys.stderr, start_new_session=True)))
+    for name, action in order:
+        if dry:
+            log(f"would: {name}")
+            continue
+        started = time.monotonic()
+        action()
+        log(f"{name} took {time.monotonic() - started:.2f}s")
+
+
+# --------------------------------------------------------------------------
+# 8. status and report
+# --------------------------------------------------------------------------
+
+def daemon_pid() -> int | None:
+    try:
+        pid = int((RUN_DIR / "daemon.pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        # The daemon runs as root.  Signal 0 against a process we do not own
+        # raises EPERM, which means it *exists* -- reporting "not running" here
+        # is the classic version of this bug.
+        return pid
+    except OSError:
+        return None
+    return pid
+
+
+def cmd_status(cfg: Config) -> int:
+    pid = daemon_pid()
+    print(f"daemon        : {'running, pid ' + str(pid) if pid else 'NOT RUNNING'}")
+    print(f"config        : {cfg.path}{'' if Path(cfg.path).exists() else ' (missing, defaults in use)'}")
+    print(f"deferring now : {'yes' if (RUN_DIR / 'deferring').exists() else 'no'}")
+    print(f"backup running: {'yes' if backup_running(cfg) else 'no'}")
+    rule = "silenced" if policy_present() \
+        else "normal (the desktop may offer the force prompt)"
+    print(f"force prompt  : {rule}")
+    print()
+    print("switches")
+    for key in ("wake_sources", "wifi_detach", "thunderbolt_eject",
+                "cifs_unmount", "defer_on_backup", "silence_force_prompt",
+                "lid_watch", "freeze_sessions"):
+        print(f"  {key:<18} {cfg.get(key)}")
+    print()
+    print("wake sources")
+    state = read_wakeup()
+    for device in cfg.words("wake_devices"):
+        print(f"  {device:<10} {'enabled' if state.get(device) else 'DISABLED' if device in state else 'absent'}")
+    print()
+    print("devices")
+    print(f"  wifi {cfg['wifi_interface']:<8} {'present' if wifi_present(cfg) else 'ABSENT'}"
+          f", {'connected' if wifi_connected(cfg) else 'not connected'}")
+    endpoints = thunderbolt_endpoints(cfg)
+    if not endpoints:
+        print("  thunderbolt      adapter not enumerated")
+    for endpoint in endpoints:
+        try:
+            authorized = (endpoint / "authorized").read_text().strip()
+        except OSError:
+            authorized = "?"
+        print(f"  thunderbolt      {endpoint.name} authorized={authorized}")
+    table = mount_table()
+    fstypes = network_fstypes(cfg)
+    seen = sorted(path for path, fstype in table.items() if fstype in fstypes)
+    if not seen:
+        print("  network          nothing mounted")
+    for path in seen:
+        print(f"  network          {path} ({table[path]})")
+    for path in cifs_remembered():
+        if path not in seen:
+            print(f"  network          {path} was unmounted for sleep, not back yet")
+    return 0
+
+
+CYCLE_MARKERS = {
+    "entry": re.compile(r"PM: suspend entry \((.+)\)"),
+    "sync": re.compile(r"Filesystems sync: ([0-9.]+) seconds"),
+    "s3": re.compile(r"Preparing to enter system sleep state S3"),
+    "resume": re.compile(r"Low-level resume complete"),
+    "tasks": re.compile(r"Restarting tasks: Done"),
+    "exit": re.compile(r"PM: suspend exit"),
+}
+
+LINE = re.compile(r"^(\S+T\S+) \S+ kernel: (.*)$")
+
+
+def cmd_report(cfg: Config, boot: str) -> int:
+    """The four questions AGENTS.md section 0a.7 requires, one row per cycle."""
+    out = run(["journalctl", "-b", boot, "-k", "-o", "short-iso", "--no-pager"], timeout=120)
+    if out.returncode != 0:
+        print(f"journalctl failed: {out.stderr.strip()[:200]}")
+        return 1
+
+    cycles: list[dict] = []
+    current: dict | None = None
+    for line in out.stdout.splitlines():
+        match = LINE.match(line)
+        if not match:
+            continue
+        stamp, message = match.group(1), match.group(2)
+        if CYCLE_MARKERS["entry"].search(message):
+            current = {"entry": stamp, "state": "entry", "last": message}
+            cycles.append(current)
+            continue
+        if current is None:
+            continue
+        current["last"] = message
+        for key in ("sync", "s3", "resume", "tasks", "exit"):
+            found = CYCLE_MARKERS[key].search(message)
+            if found and key not in current:
+                current[key] = stamp if not found.groups() else found.group(1)
+
+    if not cycles:
+        print(f"no suspend cycles in boot {boot}")
+        return 0
+
+    def stamp(value):  # "2026-10-20T11:56:35+0800" -> seconds
+        import datetime
+        try:
+            return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    print(f"boot {boot}: {len(cycles)} suspend cycle(s)\n")
+    for index, cycle in enumerate(cycles, 1):
+        slept = "s3" in cycle
+        woke = "resume" in cycle and "exit" in cycle
+        print(f"cycle {index}  entry {cycle['entry']}")
+        print(f"  1 did it sleep      : {'YES' if slept else 'NO'}")
+        if not slept:
+            print(f"  2 where it stopped  : {cycle['last'][:100]}")
+        else:
+            print(f"  2 filesystems sync  : {cycle.get('sync', 'absent')}")
+            start, end = stamp(cycle["entry"]), stamp(cycle.get("exit", ""))
+            if start and end:
+                print(f"  3 was it a wake     : {'YES' if woke else 'NO'}")
+                print(f"    wall clock        : {end - start:.1f}s (includes time asleep)")
+            else:
+                print(f"  3 was it a wake     : {'YES' if woke else 'NO'}")
+        print("  4 wake source        : not in the journal; take a snapshot of")
+        print("                         /sys/class/wakeup/*/event_count around the run")
+        print()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 9. commands
+# --------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="mbp-sleep", description=__doc__)
+    parser.add_argument("--conf", default=DEFAULT_CONF)
+    parser.add_argument("command", choices=[
+        "daemon", "pre", "post", "status", "report", "dry-run", "wifi-verify",
+        "cifs-reconnect", "wake", "detach", "restore",
+    ])
+    parser.add_argument("--boot", default="0")
+    args = parser.parse_args(argv)
+    cfg = Config(args.conf)
+
+    if args.command == "daemon":
+        return Daemon(cfg).run()
+    if args.command == "pre":
+        do_pre(cfg)
+        return 0
+    if args.command == "post":
+        do_post(cfg)
+        return 0
+    if args.command == "wifi-verify":
+        wifi_verify(cfg)
+        return 0
+    if args.command == "cifs-reconnect":
+        cifs_reconnect(cfg)
+        return 0
+    if args.command == "wake":
+        apply_wake_sources(cfg)
+        return 0
+    if args.command == "detach":
+        do_pre(cfg)
+        return 0
+    if args.command == "restore":
+        do_post(cfg)
+        return 0
+    if args.command == "status":
+        return cmd_status(cfg)
+    if args.command == "report":
+        return cmd_report(cfg, args.boot)
+    if args.command == "dry-run":
+        print("pre-suspend:")
+        do_pre(cfg, dry=True)
+        print("post-resume:")
+        do_post(cfg, dry=True)
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
