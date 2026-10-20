@@ -99,8 +99,9 @@ mbp-sleep report --boot 0        # --boot -1 for the previous boot
 ```
 
 It answers, for every cycle in that boot: **did it sleep, where did it stop if
-not, was it a wake, and which wake source fired.** If a cycle goes wrong, that
-output is the thing to attach to a report.
+not, and was it a wake.** The wake source itself is not in the journal — take a
+`/sys/class/wakeup/*/event_count` snapshot around a run for that. If a cycle goes
+wrong, that output is the thing to attach to a report.
 
 ## Configuration
 

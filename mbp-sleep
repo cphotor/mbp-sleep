@@ -873,14 +873,45 @@ def do_pre(cfg: Config, dry: bool = False) -> None:
         log(f"{name} took {time.monotonic() - started:.2f}s")
 
 
+def spawn_detached(cfg: Config, command: str) -> None:
+    """Start a helper that must outlive the sleep hook.
+
+    `start_new_session` was not enough.  It detaches the session, not the
+    cgroup, so the child stays in `systemd-suspend.service`; that unit is
+    `Type=oneshot` with `KillMode=control-group`, and systemd kills what is
+    left in the cgroup when the unit stops.  Measured on 2026-10-20: a
+    `setsid` child of an exiting oneshot unit with that KillMode died every
+    time, and the CIFS reconnect left no log at all -- not even the "gave up"
+    line it prints after 120 s.
+
+    A transient unit lives outside the sleep unit's cgroup and therefore
+    survives the hook.  The plain child is kept as a fallback for a system
+    without `systemd-run`.
+    """
+    unit = f"mbp-sleep-{command}-{os.getpid()}-{int(time.time())}"
+    argv = [
+        "systemd-run", "--unit", unit, "--collect", "--no-block",
+        "--description", f"mbp-sleep {command}",
+        sys.executable, os.path.abspath(__file__), "--conf", cfg.path, command,
+    ]
+    result = run(argv, timeout=10)
+    if result.returncode == 0:
+        log(f"{command}: started as transient unit {unit}")
+        return
+    log(f"{command}: systemd-run failed ({(result.stderr or result.stdout).strip()[:100]}); "
+        f"falling back to a detached child, which the sleep unit may kill")
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--conf", cfg.path, command],
+        stdout=sys.stdout, stderr=sys.stderr, start_new_session=True,
+    )
+
+
 def do_post(cfg: Config, dry: bool = False) -> None:
     order: list[tuple[str, callable]] = []
     if cfg.on("wifi_detach"):
         # Detached: NetworkManager is only told to come back after this hook
         # returns, so waiting for it here would always time out.
-        order.append(("wifi restore", lambda: subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--conf", cfg.path, "wifi-verify"],
-            stdout=sys.stdout, stderr=sys.stderr, start_new_session=True)))
+        order.append(("wifi restore", lambda: spawn_detached(cfg, "wifi-verify")))
     if cfg.on("thunderbolt_eject"):
         order.append(("thunderbolt reauthorise", lambda: (
             time.sleep(cfg.num("thunderbolt_settle", 2)),
@@ -888,9 +919,7 @@ def do_post(cfg: Config, dry: bool = False) -> None:
     if cfg.on("cifs_unmount"):
         # Detached for the same reason as the Wi-Fi: the network is not back
         # yet when this hook runs.
-        order.append(("cifs reconnect", lambda: subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--conf", cfg.path, "cifs-reconnect"],
-            stdout=sys.stdout, stderr=sys.stderr, start_new_session=True)))
+        order.append(("cifs reconnect", lambda: spawn_detached(cfg, "cifs-reconnect")))
     for name, action in order:
         if dry:
             log(f"would: {name}")

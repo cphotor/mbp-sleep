@@ -2191,3 +2191,197 @@ git revert --no-edit "$(git log --format=%H --grep='Prune the documentation' -1)
 
 **Rule 3.** Not breached.
 
+
+---
+## C39 — the record was corrected with real S3 residence, and a five-minute sleep was measured
+
+**When.** The sleep test ran 2026-10-20 20:17:54 → 20:22:56. This entry and the
+document correction were written at 20:35. Neither changed any machine state.
+
+**Why.** The documentation pass that was interrupted at 19:20 had begun to
+retract the Thunderbolt explanation using two S3 figures — "100.5 s and 5.9 s" —
+that were read from the wrong column. They are the *awake* times of the 11:56
+and 10:59 cycles on boot -1; the real S3 residences are **2.443 s** and
+**57.450 s**. The 2.443 s cycle is an instant wake, so it cannot support "the
+adapter attached is harmless". The operator's report that the two-second wake
+had stopped and the wrong numbers needed the same measurement.
+
+**What.** No change to the machine. Documents changed:
+
+1. `README.md`: one usage statement corrected — it no longer says
+   `mbp-sleep report` answers "which wake source fired". The measurements stay
+   out of the README, which describes the program for other users; this file and
+   `docs/background.md` carry the test record.
+2. `docs/background.md`: the retraction section is replaced by the two symptoms
+   measured separately, with the per-boot table and the distinction between
+   correlation and attribution.
+3. `docs/config-changes.md`: this entry.
+
+**How the number is measured.** `journalctl -b N -o json`, then for the
+`PM: suspend entry` / `PM: suspend exit` pair:
+
+```
+S3 = (__REALTIME_TIMESTAMP_exit - __REALTIME_TIMESTAMP_entry)
+   - (__MONOTONIC_TIMESTAMP_exit - __MONOTONIC_TIMESTAMP_entry)
+```
+
+Monotonic time does not advance in S3. The wall-clock figure printed by
+`mbp-sleep report` includes the pre-suspend work (the 194.6 s and 95.6 s syncs
+are in it) and is not S3.
+
+**What the measurement showed.**
+
+| cycle | devices before sleep | S3 |
+|---|---|---|
+| boot -2, 23 of 24 sleeps | adapter absent for most of them; `brcmfmac` loaded | 1.6–2.9 s |
+| boot -1, 10:59 | adapter `0-3` attached, authorised (no hook) | 57.450 s |
+| boot -1, 11:56 | adapter `0-1` attached, authorised (no hook) | 2.443 s |
+| boot -1, 16:09 | `0-1 authorized=0`; `brcmfmac` unload FAILED (`in use`) | 2.466 s |
+| boot 0, 16:55 | `brcmfmac_wcc` + `brcmfmac` unloaded; `0-1 authorized=0` | 17.630 s |
+| boot 0, 19:46 | same | 13.531 s |
+| boot 0, 20:17 | same | **297.616 s** |
+
+The Thunderbolt adapter was absent for most of boot -2's two-second wakes, and
+de-authorising its endpoint at 16:09 did not stop one. Every two-second wake had
+`brcmfmac` loaded, and the three cycles in which it actually unloaded did not have
+one — but loaded is not sufficient (57.450 s and 1851 s also had it loaded).
+**Correlation, not attribution**; the mechanism is unknown and the wake source is
+not written to the journal.
+
+**The 20:17 test.** Queued 20:17:38, `PM: suspend entry` 20:17:54, wake
+20:22:56 (operator, power button), `Restarting tasks` normal, Wi-Fi and adapter
+restored. It is the first cycle in the retained journal that slept longer than
+57 s under the current hook, and the first with no two-second wake after a
+successful Wi-Fi unload. It says nothing about staying asleep unattended: the
+operator ended it.
+
+**Defect found in the same test, not fixed.** `/mnt/tmcap2` did not come back.
+The hook logged `cifs reconnect took 0.00s` (it spawns a detached
+`mbp-sleep cifs-reconnect`), but no `cifs: all shares are back` and no
+`gave up` line followed — not even the one the child prints after its 120 s
+deadline. `/run/mbp-sleep/network-unmounted` still contains `/mnt/tmcap2`, and
+`mbp-sleep status` reported it "not back yet" nine minutes later. The server was
+reachable at the time (TCP 445 to `syncs.asuscomm.com` succeeded).
+
+**Likely mechanism, not verified.** The child is started with
+`start_new_session=True`, which changes the session but not the cgroup.
+`systemd-suspend.service` has `KillMode=control-group` and `Type=oneshot`, so
+when the hook returns the unit stops and systemd kills what is left in its
+cgroup — including the child, before NetworkManager has brought the network
+back. That would produce exactly what was seen: no output at all from the child.
+The same spawn pattern is used for `wifi-verify`. C33's remaining criterion — a
+real sleep followed by a successful remount — is still not met.
+
+**Not changed.** The program. S3 residence is still only obtainable by hand from
+the journal; `mbp-sleep report` prints wall clock.
+
+**Worked.** The measurement is reproducible from `journalctl -b 0/-1/-2 -o json`.
+The "no two-second wake after a successful Wi-Fi unload" statement is n=3 and one
+of the three was ended by hand; it is not a fix claim.
+
+**Undo.** The text this pass replaced is in `HEAD`:
+```sh
+git show HEAD:README.md > README.md
+git show HEAD:docs/background.md > docs/background.md
+```
+
+**Rule 3.** Not breached: no wake source, module or Thunderbolt router was
+changed. The test detached devices for the sleep and restored them on resume, as
+the program always does.
+
+---
+## C40 — the post-resume helpers run in their own transient units
+
+**When.** 2026-10-20 21:08, installed by `install.sh`
+(`/var/backups/mbp-sleep/20261020-210841`). `/etc/mbp-sleep.conf` was kept.
+
+**Why.** `/mnt/tmcap2` has not come back after a sleep since 16:48. The cause is
+not C36's discovery: the 16:55 cycle still used the old named list (its log has
+`cifs: /mnt/hx is autofs, nothing to unmount`) and failed the same way.
+
+The cause is how C33 detached the helper. The old hook ran
+
+```
+systemd-run --no-block --on-active=25 --unit=cifs-remount-tmcap2 \
+    systemctl start mnt-tmcap2.mount
+```
+
+a transient timer in its own unit. It worked: `cifs-remount-tmcap2.timer` and
+`.service` remounted the share at 10:48:25, 11:01:07 and 11:58:53, 29-40 s after
+resume. C33 replaced it with `subprocess.Popen(..., start_new_session=True)`.
+`start_new_session` changes the session, not the cgroup: the child stays in
+`systemd-suspend.service`, which is `Type=oneshot` with `KillMode=control-group`.
+When the hook returns the unit stops and systemd kills the child. Measured:
+16:55:37, 19:46:26 and 20:17:40 each unmounted the share; the reconnect then
+left **no log at all**, not even the `gave up` line it prints after 120 s. The
+mounts at 17:17:14 and 20:16:59 were `borg-backup.service` pulling in the mount,
+not the reconnect.
+
+**What.** `mbp-sleep` gains `spawn_detached()`. It starts the helper as
+
+```
+systemd-run --unit=mbp-sleep-<command>-<pid>-<epoch> --collect --no-block
+```
+
+so the helper is in its own cgroup and is not killed with the sleep unit. If
+`systemd-run` fails, it falls back to the old `Popen` and says so in the log.
+Both `wifi-verify` and `cifs-reconnect` use it.
+
+**Where.** `mbp-sleep` (source) -> `/usr/local/sbin/mbp-sleep`; `do_post()`.
+
+**Verified while awake.**
+
+| check | result |
+|---|---|
+| `python3 -m py_compile mbp-sleep` | passes |
+| a `setsid` child of a `KillMode=control-group` oneshot unit | killed (no file after 6 s) |
+| the same command under `systemd-run --collect --no-block` | survived (file present) |
+| installed hash | `f3e7bfe3778572692886a33473e59182cc028a42794515ef259928e49aa6f92d` |
+
+**Not yet tested.** That the remount works after a **real** suspend, and after
+the equivalent `post`-under-a-oneshot-unit test. That is the criterion; until it
+is met this entry reads `not yet tested`.
+
+**Known, not fixed.** C36's discovery has one edge: if a share is already
+unmounted before sleep and `/run/mbp-sleep/network-unmounted` is empty, the
+target list is empty, `cifs_satisfied()` returns true for the empty list, and
+nothing tries to mount it. The old named list did try. It did not cause the
+observed failures (the share was mounted at each of those sleeps), but it is a
+real hole in "discover by type".
+
+**Undo.**
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/20261020-210841/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec systemctl restart mbp-sleep.service
+```
+
+**Rule 3.** Not breached.
+
+**C40a — the equivalent test passed (2026-10-20 21:15).** `/mnt/tmcap2` was
+already unmounted and `/run/mbp-sleep/network-unmounted` held it. `post` was
+started inside `mbp-post-test-211426.service` with `Type=oneshot` and
+`KillMode=control-group` — the condition that killed the old child. The parent
+deactivated at 21:15:04; `mbp-sleep-cifs-reconnect-51870-1792502104.service`
+stayed alive and logged `cifs: started mnt-tmcap2.mount` and
+`cifs: all shares are back` at 21:15:09. The state file was gone. The
+`wifi-verify` helper also ran in its own unit and exited cleanly.
+
+The real-suspend criterion is still untested: in this test the network was
+already up, so the retry path (which the real resume needs) was not exercised.
+
+**C40b — the real-suspend test passed (2026-10-20 21:21-21:31).** Suspend
+requested 21:21:49, `PM: suspend entry (deep)` 21:21:51, wake 21:31:32. S3
+residence **573.422 s** (realtime delta minus monotonic delta); no two-second
+wake. The post hook started
+`mbp-sleep-cifs-reconnect-52822-1792503094.service` at 21:31:34. The first two
+mount attempts failed while the network was still down (21:31:34 and 21:31:38),
+`wlan0` connected at 21:31:39, and the third attempt logged
+`cifs: started mnt-tmcap2.mount` and `cifs: all shares are back` at 21:31:44.
+`/mnt/tmcap2` was mounted and `/run/mbp-sleep/network-unmounted` was cleared.
+
+**The C40 criterion is met.** The helper survived the stop of
+`systemd-suspend.service`, and the retry path works after a real resume. C40's
+`not yet tested` is superseded for this criterion; the "share already down
+before sleep and no state record" hole noted there is still open.
