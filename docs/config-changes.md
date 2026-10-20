@@ -2385,3 +2385,45 @@ mount attempts failed while the network was still down (21:31:34 and 21:31:38),
 `systemd-suspend.service`, and the retry path works after a real resume. C40's
 `not yet tested` is superseded for this criterion; the "share already down
 before sleep and no state record" hole noted there is still open.
+
+---
+## C41 — the installed program reports its version
+
+**When.** 2026-10-20 22:28, `install.sh`
+(`/var/backups/mbp-sleep/20261020-222800`).
+
+**Why.** C40's binary was installed at 21:08, before the version source existed.
+It had no `--version`, and `/usr/local/share/mbp-sleep/VERSION` did not exist, so
+the installed program could not say which release it was.
+
+**What.** Installed the current `mbp-sleep` (0.1.1: C40 plus `--version`) and
+copied `VERSION` to `/usr/local/share/mbp-sleep/VERSION`. No configuration
+change.
+
+**Where.** `/usr/local/sbin/mbp-sleep`,
+`/usr/local/share/mbp-sleep/VERSION`.
+
+**Verified.**
+
+| check | result |
+|---|---|
+| `mbp-sleep --version` | `mbp-sleep 0.1.1` |
+| `/usr/local/share/mbp-sleep/VERSION` | `0.1.1` |
+| installed hash | `ba0bc6ea3f5020b6c37f700e80f43c3ae110fa9e005c151093aa422ce3be4cfa` (same as the repository file) |
+| service | active / enabled |
+| `mbp-sleep status` | no backup running, not deferring, share mounted |
+
+**Worked.** Yes for the version output and the install. The C40 behaviour was
+already exercised on a real sleep (C40b).
+
+**Undo.**
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/20261020-222800/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec rm -f /usr/local/share/mbp-sleep/VERSION
+pkexec rmdir /usr/local/share/mbp-sleep 2>/dev/null || true
+pkexec systemctl restart mbp-sleep.service
+```
+
+**Rule 3.** Not breached.
