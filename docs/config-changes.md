@@ -2427,3 +2427,39 @@ pkexec systemctl restart mbp-sleep.service
 ```
 
 **Rule 3.** Not breached.
+
+---
+## C42 — retraction: unloading `brcmfmac` does not prevent the two-second wake
+
+**When.** Noticed 2026-10-21 09:51 in the journal of boot 0. No machine change.
+
+**Why.** C39 and C40 recorded a correlation: every two-second wake had
+`brcmfmac` loaded, and the cycles in which it actually unloaded slept 13-573 s.
+The 23:06 cycle on 2026-10-20 falsifies it.
+
+**What the machine shows.**
+
+| cycle | devices before sleep | S3 residence |
+|---|---|---|
+| 23:06:19 | `brcmfmac_wcc` + `brcmfmac` unloaded; Thunderbolt `0-1 authorized=0` | **2.749 s** |
+| 23:20:22 | same | **37753.242 s** |
+
+The first is an instant wake with the Wi-Fi driver absent, so a loaded driver is
+not necessary. The second is the first unattended ten-hour sleep in the retained
+journal: resumed 09:49:40, CIFS reconnect started 09:49:42, share back 09:49:53.
+
+The 23:06 attempt followed `Lid closed.` at 23:06:17; the machine woke at
+23:06:30 and stayed up until `Lid opened.` at 23:17:35. No
+`/sys/class/wakeup/*/event_count` snapshot was taken for that cycle, so the
+source of that wake is not known.
+
+**What was changed.** `docs/background.md`: the instant-wake section and the
+"what is established" row now record the 23:06 counterexample instead of the
+correlation; the boot-0 row includes the 2.749 s and 37753.24 s cycles.
+
+**Worked.** Not a fix; the retraction is the change. Attributing the wake needs a
+wakeup snapshot taken around the sleep, which the 23:06 cycle did not have.
+
+**Undo.** `git revert` this commit; the prior text is in the parent commit.
+
+**Rule 3.** Not breached.

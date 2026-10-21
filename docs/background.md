@@ -19,7 +19,7 @@ back" — and the investigation later found a second, different one: "it wakes b
 itself about two seconds after sleeping". They are not the same event, and they
 do not rest on the same evidence.
 
-### Instant wake: measured, one device still standing
+### Instant wake: measured, cause not known
 
 S3 residence for every cycle the journal still holds. It is measured from
 `journalctl -b N -o json`, because monotonic time does not advance in S3:
@@ -36,7 +36,7 @@ also contains the pre-suspend work.
 |---|---|---|
 | -2 (10-19 16:22 → 10-20 02:09) | 24 | **23 at 1.6–2.9 s**; one at 1851 s |
 | -1 (10-20 10:32 → 16:53) | 4 | 21.7 s (after a 194.6 s sync), 57.45 s, **2.443 s**, **2.466 s** |
-| 0 (10-20 16:53 →) | 4 | 17.63 s, 13.53 s, **297.62 s**, **573.42 s** |
+| 0 (10-20 16:53 → 10-21 09:49) | 6 | 17.63 s, 13.53 s, 297.62 s, 573.42 s, **2.749 s**, **37753.24 s** |
 
 What separates them:
 
@@ -49,12 +49,19 @@ What separates them:
   `brcmfmac_wcc` and `brcmfmac`, and slept **17.63 s, 13.53 s, 297.62 s and
   573.42 s**.
 
-**Every two-second wake in the journal had `brcmfmac` loaded, and the four
-cycles in which it actually unloaded did not have one.** That is a correlation,
-not an attribution: two sleeps with it loaded also avoided the wake (57.45 s and
-1851 s), so loaded is not sufficient, and the mechanism is not known. The two
-longest cycles (297.62 s and 573.42 s) were ended by the operator; the machine
-has not been left asleep unattended for hours.
+**Unloading the Wi-Fi driver does not prevent the two-second wake.** That was
+the working correlation until 2026-10-20 23:06: every two-second wake had
+`brcmfmac` loaded, and the four cycles in which it actually unloaded had slept
+13-573 s. At 23:06:19 the hook unloaded `brcmfmac_wcc` and `brcmfmac`,
+de-authorised the Thunderbolt endpoint, and the machine still woke after
+**2.749 s**. The same detachment then slept **37753.24 s** at 23:20. The wake is
+intermittent, not tied to the driver state, and the mechanism is not known.
+
+The 23:06 attempt followed `Lid closed.` at 23:06:17; the machine woke at
+23:06:30 and stayed up until `Lid opened.` at 23:17:35. No
+`/sys/class/wakeup/*/event_count` snapshot was taken for that cycle, so its wake
+source is unknown. The 23:20 cycle is the first unattended ten-hour sleep in the
+retained journal.
 
 ### "It sleeps but never comes back": not established
 
@@ -77,7 +84,7 @@ immediately before `PM: suspend entry`.
 |---|---|---|
 | 1 | **A CIFS/NFS mount with unwritten data whose server is gone blocks the sleep.** `Filesystems sync` took **194.646 s** and **95.554 s** on 2026-10-20; the same operation took **0.014–0.031 s** once the share was unmounted before `suspend(2)`. | Both figures are in `journalctl -b -1` and can be re-read at any time. |
 | 2 | **`/proc/acpi/wakeup` comes back from every boot with the internal keyboard/touchpad source (`SPIT`) disabled.** | Read `/proc/acpi/wakeup` after a cold boot; the daemon re-arms what `wake_devices` lists. |
-| 3 | **The "instant wake" is an S3 residence of about two seconds, and de-authorising the Thunderbolt endpoint does not stop it.** | Boot -2: 23 of 24 real sleeps at 1.6–2.9 s. Boot -1 16:09: `authorized=0`, S3 2.466 s. The formula and the full table are above. |
+| 3 | **The "instant wake" is an S3 residence of about two seconds; neither de-authorising the Thunderbolt endpoint nor unloading `brcmfmac` stops it.** | Boot -2: 23 of 24 real sleeps at 1.6–2.9 s. Boot -1 16:09: `authorized=0`, S3 2.466 s. Boot 0 23:06:19: both `brcmfmac` modules unloaded, `authorized=0`, S3 2.749 s. |
 
 ### On record, not re-verified
 
@@ -86,11 +93,12 @@ the transaction with `-EIO`. The runs that produced that are no longer in the
 journal. The program unloads the module before sleep regardless, because a
 module that is not loaded cannot refuse.
 
-A loaded `brcmfmac` is also the current suspect for the two-second wake (above),
-but that is a correlation, not an attribution. The wake source is not written to
-the journal; one candidate for this model, the EC's GPE `0x4E`, was masked and
-the machine still woke at 2.47 s, so it was not the source on that run. It has
-never been confirmed as a source on any other.
+A loaded `brcmfmac` was the suspect for the two-second wake until 2026-10-20
+23:06; that cycle woke with the module unloaded, so it is not a sufficient
+cause. The wake source is not written to the journal. One candidate for this
+model, the EC's GPE `0x4E`, was masked and the machine still woke at 2.47 s, so
+it was not the source on that run. It has never been confirmed as a source on
+any other, and the 23:06 cycle has no wakeup counter snapshot.
 
 ## Not worth re-testing
 
