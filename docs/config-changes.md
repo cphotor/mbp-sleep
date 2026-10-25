@@ -2721,3 +2721,59 @@ installed, so there is nothing else to restore.
 
 **Worked.** The install: yes, measured above. The behaviour it installs:
 `not yet tested`.
+
+## C44c — C44 measured on a real sleep: the branch it fixes ran, and the share came back
+
+**When.** 2026-10-25 23:43:15 to 2026-10-26 00:05:59. The operator closed the lid
+themselves; nothing was arranged to force the case.
+
+**Why.** C44b installed the fix with `Worked: not yet tested`, because the branch
+that matters needs a sleep in which `umount` is cut off after the kernel has
+already dropped the mount. This cycle had exactly that, for the fifth time — and
+this time it was read correctly.
+
+**What happened.** No change; a measurement.
+
+| time | journal | what it means |
+|---|---|---|
+| 23:43:15 | `suspend: requesting now (lid closed)` | lid closed, the daemon asked for the sleep |
+| 23:43:16 | `cifs: could not unmount /mnt/pastime rc=32` (target busy) | pastime really was still mounted — the other reading of a non-zero exit, and it stays quiet |
+| 23:43:16 | systemd: `mnt-tmcap2.mount: Deactivated successfully` | the kernel dropped tmcap2 at once |
+| 23:43:31 | `cifs: unmounted /mnt/tmcap2 (cifs), although umount exited 124; the mount table says it is gone` | **the fix**: the killed `umount` no longer destroys the record |
+| 23:43:32 | `PM: suspend entry (deep)` | S3, 17 s after the request; the 15 s `umount` timeout is the whole delay |
+| 00:05:46 | `resume: 1326s of sleep; lid is open` | 22 min of sleep, and C43's resume detection (the lid was open, so no re-suspend) |
+| 00:05:49 | `mnt-tmcap2.mount: Failed with result 'exit-code'`, `cifs: /mnt/tmcap2 not remounted; it will come back on next access` | first attempt, 3 s after the resume: the network is not back yet |
+| 00:05:53 | the same two lines | second attempt, still too early |
+| 00:05:54 | `wifi: wlan0 is connected` | the network arrives between attempts |
+| 00:05:59 | `cifs: started mnt-tmcap2.mount`, `cifs: all shares are back (/mnt/pastime, /mnt/tmcap2)` | third attempt, and the message names both shares |
+
+After it: `/proc/mounts` lists `//syncs.asuscomm.com/tmcap2 on /mnt/tmcap2` and
+pastime likewise, and `/run/mbp-sleep/network-unmounted` is gone, which is what
+`cifs_forget()` does on success.
+
+**The record was the only thing that could have named tmcap2.** At 00:05:49 the
+share was not in `/proc/mounts` — it had been unmounted 22 minutes earlier — so
+`cifs_mount()` iterating `cifs_list()` could only have reached it through the
+record taken at 23:43:16, before the first unmount. That is the whole point of
+C44, and this cycle is the proof that it holds on the machine and not only in
+the harness.
+
+**Where.** Nothing changed. `/usr/local/sbin/mbp-sleep` is still
+`24400faa…` (C44b).
+
+**Worked.** Yes, measured: the miss that happened on 2026-10-23 05:56 and 19:45
+and on 2026-10-25 14:04 and 16:41 did not happen here. `all shares are back` was
+true, and it named the shares it checked.
+
+**Two things this cycle shows that are worth keeping in mind.**
+
+1. The three attempts are not decoration: the first two failed with the network
+   still down. The old code made one attempt, logged the same sentence about the
+   next access, and never tried again — this cycle would have ended with tmcap2
+   unmounted had the record fix not been in place, since the retry loop had
+   nothing in its list to retry.
+2. `cifs: /mnt/tmcap2 not remounted; it will come back on next access` is the
+   wrong sentence for a plain `.mount` unit: nothing touches `/mnt/tmcap2` on
+   its own, and it came back because the loop under it tried again. The wording
+   belongs to the `x-systemd.automount` case. It is left as it is in this entry;
+   changing it is a separate change with its own number.
