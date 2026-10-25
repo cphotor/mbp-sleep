@@ -2670,3 +2670,54 @@ at any time.
 
 **Worked.** Not yet tested on the machine. The next real sleep whose `umount`
 is cut off at the timeout is the test, and C44b records it.
+
+## C44b — C44 installed
+
+**When.** 2026-10-25, 23:41:04 to 23:41:05, immediately after C44 was committed
+and with the operator's consent given for that install.
+
+**Why.** C44 changes what `pre` records and how a failed `umount` is read; it
+does nothing until the program on the machine is replaced.
+
+**What.** `pkexec ./install.sh` from the repository at `fcd98fb`. Only the
+program changed:
+
+| where | what | evidence |
+|---|---|---|
+| `/usr/local/sbin/mbp-sleep` | replaced with C44 | sha256 `24400faad2374f386df41c29de7d63387359bb8777384f343bb74d8098499531`, identical to the copy in the repository |
+| `/var/backups/mbp-sleep/20261025-234104/` | what the installer saved first | `mbp-sleep` sha256 `2f7c31b4…` (the C43 program), plus `mbp-sleep.service`, `50-mbp-sleep`, `50-mbp-sleep.conf` and `VERSION`, all four byte-identical to what is installed now, so the installer rewrote them with the same content |
+| `/etc/mbp-sleep.conf` | **not touched** | mtime still 16:38:00; C44 adds no configuration key |
+| `mbp-sleep.service` | restarted | `ActiveEnterTimestamp=Sun 2026-10-25 23:41:05 CST`, `MainPID=421511` |
+
+**Where.** `/usr/local/sbin/mbp-sleep`. Nothing else on the machine differs from
+before the install.
+
+**Verified so far.** The installed file is byte-identical to the committed one,
+so the machine runs C44 and nothing else. One real, harmless exercise of the new
+code: `mbp-sleep cifs-reconnect` against the real mount table printed
+`cifs: all shares are back (/mnt/pastime, /mnt/tmcap2)` — the new message, naming
+the shares, with both shares already mounted so it neither mounted nor unmounted
+anything.
+
+**Not verified.** No sleep has run with this code. Specifically, the branch that
+fixes the defect — `umount` returning non-zero while the mount table says the
+share is gone — needs a real sleep in which `umount` hangs, and that cannot be
+arranged on demand: it happened on four of the resumes recorded in C44 and on
+none of the ones before 2026-10-23. The next real sleep is the test; it is
+expected to log `cifs: unmounted <path> (cifs), although umount exited N; the
+mount table says it is gone` and then, after the resume, `cifs: started
+mnt-tmcap2.mount` followed by `cifs: all shares are back (…)`.
+
+**Undo.** Restores the C43 program:
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/20261025-234104/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec systemctl restart mbp-sleep.service
+```
+
+The four other files in that backup directory are identical to what is
+installed, so there is nothing else to restore.
+
+**Worked.** The install: yes, measured above. The behaviour it installs:
+`not yet tested`.
