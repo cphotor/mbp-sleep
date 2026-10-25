@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now lists them, `gave up` lists the ones still down, and a share that is
   still owed stays in the record for the next sleep instead of being forgotten
   by the next `pre`.
+- **`cifs: … not remounted; it will come back on next access` no longer
+  promises an automount.** Nothing touches a plain `.mount` share on its own;
+  the sentence belongs to the `x-systemd.automount` case. Measured 2026-10-26
+  00:05: the message appeared twice and the share came back because the retry
+  loop tried again, not because anything accessed it. The line now says only
+  `not remounted yet`, and `gave up` says the next sleep will try again instead
+  of saying that something touching the share will.
 
 ## [0.1.1] - 2026-10-20
 

@@ -226,9 +226,29 @@ def main() -> int:
         module.cifs_reconnect(cfg6)
     case6 = Case("giving up names what is still down")
     case6.check("message", "still down: /mnt/tmcap2" in out6.getvalue(), True)
+    case6.check("no promise that something will touch it",
+                "touches them" in out6.getvalue(), False)
     case6.check("record kept for the next sleep", module.cifs_remembered(),
                 ["/mnt/tmcap2"])
     results.append((case6, out6.getvalue()))
+
+    # 7. A failed attempt says only that the share is not back yet.
+    tmp7 = tempfile.TemporaryDirectory()
+    module.NETWORK_UNMOUNTED = Path(tmp7.name) / "network-unmounted"
+    module.cifs_remember(["/mnt/tmcap2"])
+    machine7 = Machine(module, {}, remount_ok=False)
+    module.mount_table = machine7.mount_table
+    module.run = machine7.run
+    cfg7 = module.Config("/nonexistent/mbp-sleep.conf")
+    out7 = io.StringIO()
+    with contextlib.redirect_stdout(out7):
+        module.cifs_mount(cfg7)
+    case7 = Case("a failed attempt does not promise an automount")
+    case7.check("message", "cifs: /mnt/tmcap2 not remounted yet" in out7.getvalue(),
+                True)
+    case7.check("no promise about the next access",
+                "next access" in out7.getvalue(), False)
+    results.append((case7, out7.getvalue()))
 
     for case, log in results:
         status = "ok  " if not case.failures else "FAIL"

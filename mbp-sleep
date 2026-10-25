@@ -583,7 +583,13 @@ def cifs_mount(cfg: Config) -> None:
         elif run(["mount", path], timeout=30).returncode == 0:
             log(f"cifs: mounted {path}")
         else:
-            log(f"cifs: {path} not remounted; it will come back on next access")
+            # Not "it will come back on next access": that is true of the
+            # automount case above and false of the plain `.mount` units this
+            # branch runs against, where nothing touches the share on its own.
+            # Measured 2026-10-26 00:05: three attempts, the first two with this
+            # message, and the share came back because `cifs_reconnect()` tried
+            # again three seconds later -- not because anything accessed it.
+            log(f"cifs: {path} not remounted yet")
 
 
 def cifs_satisfied(cfg: Config) -> bool:
@@ -637,7 +643,7 @@ def cifs_reconnect(cfg: Config) -> None:
             if table.get(path) not in fstypes and table.get(path) != "autofs"]
     log(f"cifs: gave up after {cfg.num('cifs_reconnect_wait', 120)} s; "
         f"still down: {', '.join(down) or 'nothing recorded'}; "
-        f"the shares will come back when something touches them")
+        f"the next sleep will try again")
 
 
 # --------------------------------------------------------------------------

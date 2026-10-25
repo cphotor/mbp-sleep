@@ -2777,3 +2777,40 @@ true, and it named the shares it checked.
    its own, and it came back because the loop under it tried again. The wording
    belongs to the `x-systemd.automount` case. It is left as it is in this entry;
    changing it is a separate change with its own number.
+
+## C45 — the retry and "gave up" messages stop promising an access that never comes
+
+**When.** 2026-10-26 00:15. Repository only: the machine still runs the 0.1.1
+program installed by C44b (sha256 `24400faa…`) until 0.1.2 is installed, if it
+is.
+
+**Why.** C44c's table at 00:05:49 and 00:05:53 shows
+`cifs: /mnt/tmcap2 not remounted; it will come back on next access`, and the
+share came back at 00:05:59 because `cifs_reconnect()` tried a third time.
+Nothing touched `/mnt/tmcap2`: it is a plain `.mount` unit, and the sentence was
+written for the `x-systemd.automount` branch a few lines above, which `continue`s
+and never reaches that `log()`. The same false promise sat in the give-up
+message, `the shares will come back when something touches them`.
+
+**What.**
+
+| file | change |
+|---|---|
+| `mbp-sleep` | `cifs_mount()`: a failed attempt logs `cifs: <path> not remounted yet`, with a comment saying why the old sentence was wrong and what it was based on. `cifs_reconnect()`: giving up logs `still down: <paths>; the next sleep will try again`. |
+| `scripts/test-cifs-record.py` | case 7 (new) asserts the new sentence and that `next access` is gone; case 6 also asserts that `touches them` is gone. |
+| `CHANGELOG.md` | the *Fixed* bullet for this change. |
+
+**Where.** The repository. `mbp-sleep` sha256
+`3ddf1e1d403049f2931d49e80b2d57503c8aed5fd8f1a9c5e1ca4e148d2f8cfe`,
+`scripts/test-cifs-record.py` sha256
+`38225897599c1c32832cea9cd0a22693acbe2f4a6aa7b0aad66c9946d224ceb5`.
+
+**Verified so far.** `scripts/test-cifs-record.py` passes 7/7. Nothing else can
+be verified: both branches only print, they do not change what the machine does.
+
+**Undo.** `git revert` the C45 commit. Nothing on the machine is touched by C45,
+so there is nothing else to undo.
+
+**Worked.** No behaviour to work or fail. What the change claims is only that
+the two sentences no longer assert something the measurements contradict, and
+the harness now fails if either sentence comes back.
