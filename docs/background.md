@@ -63,6 +63,32 @@ The 23:06 attempt followed `Lid closed.` at 23:06:17; the machine woke at
 source is unknown. The 23:20 cycle is the first unattended ten-hour sleep in the
 retained journal.
 
+### The consequence: a self-wake with the lid shut is not followed by a sleep
+
+Measured 2026-10-23/25 on boot 0, from the kernel journal and
+`systemd-logind`'s own lid messages:
+
+| suspend entered | resumed | lid | awake afterwards |
+|---|---|---|---|
+| 12:03:10 | 12:04:09 (**59 s**) | closed the whole time | **7 h 14 min**, until `Lid opened.` at 19:18:55 |
+| 19:45:27 | 23:22:13 (**21646 s**) | closed the whole time | **38 h 7 min**, until `Lid opened.` at 2026-10-25 13:29:31 |
+
+logind logged **no `Lid opened.` between the close and the resume**, so these
+were not lid wakes, and no lid event was missed: the lid was shut from
+`Lid closed.` at 19:45:10 until 2026-10-25 13:29:31. Because logind's lid
+handling is off by design and the daemon acts only on an open→closed edge,
+nothing re-suspended the machine; it sat awake with the lid shut.
+
+The GNOME session history marks the session active for five minutes after each
+of these resumes (23:22:17 → 23:27:17 is exactly `idle-delay`, and the same
+signature appears at 12:04:14 → 12:09:14). That is the resume, not an operator:
+on 12:04 logind proves nobody opened the lid.
+
+**Not established:** who woke it. The counters moved (same per-cycle signature
+as F23), the source stays unattributed. **What changed:** `resuspend` sends the
+machine back to sleep when a resume finds the lid still closed, and `wake_log`
+records the counter deltas (C43).
+
 ### "It sleeps but never comes back": not established
 
 Four boots in the retained journal end at `PM: suspend entry` with no exit

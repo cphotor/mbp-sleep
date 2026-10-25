@@ -22,14 +22,17 @@ row is the exception: there, the firmware itself leaves a source disabled.
 | **It wakes, but Wi-Fi or network shares are gone.** | The driver came back without a usable radio, or the shares were unmounted on the way in and nothing put them back. | Reloads the Wi-Fi driver, waits for the interface, and re-mounts the shares with retries until the network is up. |
 | **A backup is killed by a sleep**, or a sleep requested during a backup is lost. | The desktop suspends in the middle of the job. | Holds a logind block lock while a backup runs, remembers the suspend request, and issues it again when the backup ends. |
 | **Keyboard and lid cannot wake the machine.** | `/proc/acpi/wakeup` is rebuilt at every boot, and this firmware declares the internal keyboard/touchpad source (`SPIT`) disabled. | Re-arms the configured wake sources at daemon start. It never disables one. |
+| **It wakes by itself with the lid shut and stays awake.** | The wake source is not identified, and nothing puts the machine back to sleep: logind's lid handling is off here, and a lid watch that acts only on a *fresh close* sees no change. Measured 2026-10-23: a self-wake at 23:22 left it awake, lid shut, for **38 hours**. | On resume, if the lid is still closed, suspends again after a settle delay — at most a few times in a row. Also logs which wake counters moved, so the source can be hunted. |
 
-**If the machine wakes by itself a few seconds after sleeping**, this program
-does not suppress that. It tells you whether the cycle was a wake and where it
-stopped, and you can attribute the wake by taking a snapshot of
-`/sys/class/wakeup/*/event_count` immediately before and after a run — the kernel
-does not record the wake source in the journal. One candidate for this model —
-the EC's GPE `0x4E` — was investigated and **never confirmed**; see
-`docs/background.md`.
+**If the machine wakes by itself a few seconds after sleeping**, this program does
+not suppress the wake: the source is not identified, and the one candidate that
+was investigated — the EC's GPE `0x4E` — was masked and the machine still woke,
+then the claim was retracted; see `docs/background.md`. What it does suppress is
+the consequence: with `resuspend = on`, a resume that finds the lid still closed
+sends the machine back to sleep (`resuspend_delay`), at most `resuspend_max`
+times in a row, and `wake_log` records the delta of
+`/sys/class/wakeup/*/event_count` and the ACPI GPE counters so the next wake has
+a candidate.
 
 ## Which machines
 
@@ -121,8 +124,8 @@ Format: `key = value`. `#` starts a comment. Blank lines are ignored.
 
 | keys | read by | to apply an edit |
 |---|---|---|
-| `wake_sources`, `wake_devices`, `defer_on_backup`, `backup_names`, `defer_max_wait`, `silence_force_prompt`, `lid_watch`, `lid_state` | the daemon, once at start | `sudo systemctl restart mbp-sleep` |
-| `wifi_*`, `thunderbolt_*`, `cifs_*`, `network_fstypes` | the sleep hook, on every sleep | nothing — the next suspend uses it |
+| `wake_sources`, `wake_devices`, `defer_on_backup`, `backup_names`, `defer_max_wait`, `silence_force_prompt`, `lid_watch`, `lid_state`, `resuspend`, `resuspend_delay`, `resuspend_max` | the daemon, once at start | `sudo systemctl restart mbp-sleep` |
+| `wifi_*`, `thunderbolt_*`, `cifs_*`, `network_fstypes`, `wake_log` | the sleep hook, on every sleep | nothing — the next suspend uses it |
 | `freeze_sessions` | `install.sh` | re-run `sudo ./install.sh` |
 
 Editing `macbook.conf` in the repository changes nothing on the machine; it is a
@@ -188,6 +191,29 @@ itself. To suspend immediately, stop the lock: `sudo systemctl stop mbp-sleep`.
 | `lid_watch` | `on` | handle the lid here, because logind is told to ignore it |
 | `lid_state` | `/proc/acpi/button/lid/LID0/state` | where the lid state is read |
 | `freeze_sessions` | `off` | `off` installs the drop-in that sets `SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=false` |
+
+### Self-wake
+
+The wake source on this machine is **not identified**; see `docs/background.md`
+and the retracted GPE `0x4E` diagnosis. The wake itself is therefore not
+suppressed. Its consequence is.
+
+| key | default | meaning |
+|---|---|---|
+| `resuspend` | `on` | a resume that finds the lid still closed is sent back to sleep — opening the lid is what wakes this machine, so a closed lid at resume means nobody came back |
+| `resuspend_delay` | `10` | seconds to settle before re-suspending |
+| `resuspend_max` | `3` | consecutive re-suspends before it gives up and stays awake, so a wake/suspend loop cannot run forever |
+| `wake_log` | `on` | `pre` saves `/sys/class/wakeup/*/event_count` and the ACPI GPE counters; `post` logs what moved (`wake: counters moved: …`) |
+
+A sleep longer than five minutes starts the counter again, and opening the lid
+clears it, so the cap only trips on a real loop. A deliberate test that resumes
+with the lid closed (`scripts/test-suspend.sh`) is re-suspended too — open the
+lid first, or set `resuspend = off`.
+
+`wake_log` is a **candidate finder, not a conclusion**: the Apple EC block moves
+its counters on every cycle no matter who woke the machine. Use `event_count`,
+never `wakeup_count` — the latter only moves on a retried suspend and stays 0 on
+a clean S3 cycle.
 
 ## Commands
 

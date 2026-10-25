@@ -2463,3 +2463,66 @@ wakeup snapshot taken around the sleep, which the 23:06 cycle did not have.
 **Undo.** `git revert` this commit; the prior text is in the parent commit.
 
 **Rule 3.** Not breached.
+
+---
+## C43 — a self-wake with the lid shut is followed by a sleep, and the wake counters are logged
+
+**When.** 2026-10-25. Repository change written first; the install and the sleep
+test follow and are recorded in C43b.
+
+**Why.** The machine woke itself twice on 2026-10-23 with the lid shut
+(12:03:10 → 12:04:09, 59 s; 19:45:27 → 23:22:13, 21646 s) and nothing sent it
+back to sleep: logind's lid handling is off here by design, and `mbp-sleep` acts
+only on an open→closed edge. The second one left the machine awake for
+**38 h 7 min**, lid shut, until the operator opened the lid on 2026-10-25
+13:29:31. `systemd-logind` logged no `Lid opened.` in between, so no lid event
+was missed and these were not lid wakes.
+
+The wake source is **not identified**, and this change does not identify it.
+Masking the EC's GPE `0x4E` did not stop the wake (F58, retracted), and the
+sources Linux can turn off are `SPIT`, `XHC1` and `LID0`, which the operator
+needs (AGENTS.md rule 3). So the wake is left alone and its consequence is
+removed; `wake_log` is what makes the next attribution possible.
+
+**What.**
+
+| file | change |
+|---|---|
+| `mbp-sleep` | `Daemon.detect_resume()` / `maybe_resuspend()`: `CLOCK_BOOTTIME - CLOCK_MONOTONIC` jumps by the S3 residence, so a resume is visible inside the daemon without a new hook. A resume with the lid still closed schedules a suspend after `resuspend_delay`; the count resets after a sleep of 300 s or more, or when the lid opens; `resuspend_max` caps a wake/suspend loop. `read_wake_counters()`, `wake_snapshot()` (called at the end of `pre`) and `wake_report()` (start of `post`) log which `event_count`/GPE counters moved. New defaults: `resuspend`, `resuspend_delay`, `resuspend_max`, `wake_log`. `status` lists the two new switches; `report` points at the log. |
+| `macbook.conf` | section 7 (self-wake) added; the session-freeze section renumbered to 8. |
+| `README.md`, `docs/background.md`, `CHANGELOG.md` | the behaviour, the 2026-10-23 measurement, and the unreleased entry. |
+
+**Where.** `/usr/local/sbin/mbp-sleep`; the four keys are added to
+`/etc/mbp-sleep.conf` by hand, because `install.sh` keeps the existing file and
+only reports the switches that are missing from it.
+
+**Verified so far.** The script compiles; a harness against the real counters
+moved `wakeup37` by +1 and `gpe4E` by +123 and the log line named both;
+`detect_resume()` logged `21646s`, scheduled attempt 1/3, `maybe_resuspend()`
+issued the request, four short wakes stopped at the cap, and an open-lid resume
+reset the count. **No sleep has been exercised with this code yet.**
+
+**Undo.** The previous program is the one `install.sh` backs up to
+`/var/backups/mbp-sleep/<timestamp>/mbp-sleep` (the installer prints the
+timestamp; the previous source is `git show a94e1b1:mbp-sleep`, and its sha256
+is `ba0bc6ea3f5020b6c37f700e80f43c3ae110fa9e005c151093aa422ce3be4cfa`, which is
+what `/usr/local/sbin/mbp-sleep` has held since C41 — verified again before this
+entry was written).
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/<timestamp>/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec sed -i -e '/^resuspend *=/d' -e '/^resuspend_delay *=/d' \
+    -e '/^resuspend_max *=/d' -e '/^wake_log *=/d' /etc/mbp-sleep.conf
+pkexec systemctl restart mbp-sleep.service
+```
+
+`resuspend = off` alone stops the new behaviour without reinstalling; the
+counters keep being logged until `wake_log = off`.
+
+**Worked.** Not yet tested — the change is written into the repository only; the
+install and the sleep test have not happened yet, and C43b records them.
+
+**Rule 3.** Not breached. No wake source is disabled or removed: `LID0`,
+`SPIT` and `XHC1` stay enabled. The change only decides to sleep again after a
+wake nobody asked for.

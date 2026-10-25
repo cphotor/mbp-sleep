@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A self-wake no longer leaves the machine awake with the lid shut.** The
+  machine has a wake source that is not identified, and nothing re-suspended it:
+  logind's lid handling is off here, and the daemon acts only on an
+  open→closed edge. Measured 2026-10-23: a self-wake at 23:22 left it awake,
+  lid shut, for **38 hours**. On resume the daemon now notices the S3 residence
+  through `CLOCK_BOOTTIME` (which counts sleep; `CLOCK_MONOTONIC` does not) and,
+  if the lid is still closed, suspends again after `resuspend_delay` seconds, at
+  most `resuspend_max` times in a row. The wake itself is not suppressed — the
+  source is still unknown, and the only sources that could be disabled are the
+  keyboard and lid wake that must keep working.
+- **Wake attribution.** `wake_log`: the `pre` hook saves
+  `/sys/class/wakeup/*/event_count` and the ACPI GPE counters, the `post` hook
+  logs what moved (`wake: counters moved: …`). `event_count`, not
+  `wakeup_count`: the latter is only incremented on a retried suspend and stays
+  `0` on a clean S3 cycle. A mover is a candidate, not a cause — the Apple EC
+  block moves its counters on every cycle.
+
+### Changed
+
+- `mbp-sleep report` points at the new attribution log instead of telling the
+  reader to take a snapshot by hand.
+- `macbook.conf` grew sections 7 (self-wake) and 8 (the session freeze, was 7).
+
 ## [0.1.1] - 2026-10-20
 
 ### Fixed

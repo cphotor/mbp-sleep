@@ -31,6 +31,7 @@ Design notes that are easy to get wrong again:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -89,6 +90,10 @@ DEFAULTS = {
     "silence_force_prompt": "on",
     "lid_watch": "on",
     "lid_state": "/proc/acpi/button/lid/LID0/state",
+    "resuspend": "on",
+    "resuspend_delay": "10",
+    "resuspend_max": "3",
+    "wake_log": "on",
     "freeze_sessions": "off",
 }
 
@@ -147,6 +152,20 @@ def have(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+def sleep_clock_offset() -> float:
+    """CLOCK_BOOTTIME counts time spent in S3, CLOCK_MONOTONIC does not.
+
+    The difference is constant while the machine runs, so a jump in it is the
+    only evidence a resume leaves behind that needs no hook and no journal.  On
+    this machine the two clocks differ by exactly the S3 residence: the
+    2 s wakes of 2026-10-20 and the 21646 s wake of 2026-10-23 both show up.
+    """
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+    except (AttributeError, OSError):
+        return 0.0
+
+
 # --------------------------------------------------------------------------
 # 1. ACPI wake sources
 # --------------------------------------------------------------------------
@@ -184,6 +203,92 @@ def apply_wake_sources(cfg: Config) -> None:
             continue
         after = read_wakeup().get(device)
         log(f"wake: {device} -> {'enabled' if after else 'still disabled'}")
+
+
+# --------------------------------------------------------------------------
+# 1b. What woke the machine
+# --------------------------------------------------------------------------
+# The kernel does not write the wake source to the journal.  The counters under
+# /sys/class/wakeup and the ACPI GPE counters do move, so `pre` saves them and
+# `post` logs what changed.  Two traps, both measured on this machine:
+#
+#   * `wakeup_count` is the wrong field.  drivers/base/power/wakeup.c only
+#     increments it when `events_check_enabled` is set, which happens in
+#     try_to_fallback_suspend() -- a retried suspend, not a clean S3 cycle.  It
+#     stays 0 across every successful sleep, so a snapshot keyed on it records
+#     nothing.  `event_count` is the field that moves.
+#   * The Apple EC block moves its counters on *every* cycle regardless of who
+#     woke the machine (LID +2, ACPI0003/EC/ADP1 +1 per cycle).  So a mover is a
+#     candidate, not a conclusion; see docs/background.md.
+
+WAKEUP_CLASS = Path("/sys/class/wakeup")
+GPE_COUNTERS = Path("/sys/firmware/acpi/interrupts")
+WAKEUP_SNAPSHOT = RUN_DIR / "wakeup-before"
+
+
+def wakeup_name(node: Path) -> str:
+    try:
+        return (node / "name").read_text().strip() or node.name
+    except OSError:
+        return node.name
+
+
+def read_wake_counters() -> dict[str, int]:
+    counters: dict[str, int] = {}
+    for node in sorted(WAKEUP_CLASS.glob("wakeup*")):
+        try:
+            counters[node.name] = int((node / "event_count").read_text())
+        except (OSError, ValueError):
+            continue
+    for node in sorted(GPE_COUNTERS.glob("gpe*")):
+        if node.name == "gpe_all":
+            continue
+        try:
+            counters[node.name] = int(node.read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            continue
+    return counters
+
+
+def wake_snapshot(cfg: Config) -> None:
+    """Save the counters before a sleep, for `wake_report` to diff."""
+    if not cfg.on("wake_log"):
+        return
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "counters": read_wake_counters(),
+            "names": {node.name: wakeup_name(node)
+                      for node in WAKEUP_CLASS.glob("wakeup*")},
+        }
+        WAKEUP_SNAPSHOT.write_text(json.dumps(payload))
+    except OSError as exc:
+        log(f"wake: cannot save the counter snapshot: {exc}")
+
+
+def wake_report(cfg: Config) -> None:
+    """Log which counters moved across the sleep that just ended."""
+    if not cfg.on("wake_log"):
+        return
+    try:
+        payload = json.loads(WAKEUP_SNAPSHOT.read_text())
+        WAKEUP_SNAPSHOT.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        log("wake: no counter snapshot from before the sleep; source not recorded")
+        return
+    before = payload.get("counters", {})
+    names = payload.get("names", {})
+    after = read_wake_counters()
+    moved = [(key, value - before[key]) for key, value in after.items()
+             if key in before and value != before[key]]
+    if not moved:
+        log("wake: no wakeup or GPE counter moved; the source is not among the "
+            "counters this kernel exposes")
+        return
+    moved.sort(key=lambda item: -abs(item[1]))
+    parts = [f"{key}({names[key]}) {delta:+d}" if key.startswith("wakeup") else
+             f"{key} {delta:+d}" for key, delta in moved]
+    log("wake: counters moved: " + ", ".join(parts))
 
 
 # --------------------------------------------------------------------------
@@ -664,6 +769,13 @@ class Daemon:
         self.lock_since = 0.0
         self.gave_up = False
         self.self_initiated_until = 0.0
+        # Self-wake handling.  The machine has an unattributed wake source and
+        # logind's lid handling is off, so a wake with the lid still closed used
+        # to leave it awake indefinitely (38 hours on 2026-10-23).  The lid-edge
+        # watch below cannot see that: it only fires on a fresh close.
+        self.boot_offset = sleep_clock_offset()
+        self.resuspend_at = 0.0
+        self.resuspend_count = 0
         # Scanning /proc costs ~7.6 ms on this machine (450 processes), which is
         # 0.8% CPU once a second for nothing.  The lid and the bus both force a
         # fresh scan when it matters, so the background poll can be lazy.
@@ -784,8 +896,56 @@ class Daemon:
         except OSError:
             return self.lid_closed
 
+    # -- self-wake ----------------------------------------------------------
+    def detect_resume(self) -> None:
+        """Notice a sleep that ended, and decide whether to go back to it.
+
+        The wake itself cannot be suppressed: the source is not identified (see
+        docs/background.md, and the retracted GPE 0x4E diagnosis).  What can be
+        suppressed is its consequence.  A resume that finds the lid still closed
+        was not the operator coming back -- opening the lid is what wakes this
+        machine -- so the machine is sent back to sleep after a settle delay.
+        """
+        offset = sleep_clock_offset()
+        slept = offset - self.boot_offset
+        if slept < 0.5:
+            return
+        self.boot_offset = offset
+        closed = self.lid_is_closed()
+        log(f"resume: {slept:.0f}s of sleep; lid is {'closed' if closed else 'open'}")
+        if not self.cfg.on("resuspend"):
+            return
+        if not closed:
+            self.resuspend_count = 0
+            return
+        # A long sleep is a fresh event, not a wake/suspend loop: an 11 s loop
+        # trips the cap, a wake after hours starts counting again from one.
+        if slept >= 300:
+            self.resuspend_count = 0
+        limit = self.cfg.num("resuspend_max", 3)
+        if self.resuspend_count >= limit:
+            self.resuspend_at = 0.0
+            log(f"resuspend: woke {limit} times in a row with the lid closed; "
+                f"staying awake instead of looping")
+            return
+        self.resuspend_count += 1
+        delay = self.cfg.num("resuspend_delay", 10)
+        self.resuspend_at = time.monotonic() + delay
+        log(f"resuspend: suspending again in {delay}s with the lid still closed "
+            f"(attempt {self.resuspend_count}/{limit})")
+
+    def maybe_resuspend(self) -> None:
+        if not self.resuspend_at or time.monotonic() < self.resuspend_at:
+            return
+        self.resuspend_at = 0.0
+        if not self.lid_is_closed():
+            self.resuspend_count = 0
+            return
+        self.request("woke with the lid still closed")
+
     # -- main loop ----------------------------------------------------------
     def tick(self) -> None:
+        self.detect_resume()
         if self.cfg.on("defer_on_backup"):
             running = self.backup_state()
             if running and not self.block.held and not self.gave_up:
@@ -830,7 +990,12 @@ class Daemon:
                 if self.pending:
                     log("suspend: lid reopened, the pending request is cancelled")
                 self.pending = False
+                self.resuspend_count = 0
+                if self.resuspend_at:
+                    log("resuspend: lid reopened, the re-suspend is cancelled")
+                    self.resuspend_at = 0.0
             self.lid_closed = closed
+        self.maybe_resuspend()
 
     def run(self) -> int:
         RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -889,6 +1054,10 @@ def do_pre(cfg: Config, dry: bool = False) -> None:
         started = time.monotonic()
         action()
         log(f"{name} took {time.monotonic() - started:.2f}s")
+    if not dry:
+        # Last: the counters are read as late as possible before S3, and the
+        # diff is logged by `post` (see section 1b).
+        wake_snapshot(cfg)
 
 
 def spawn_detached(cfg: Config, command: str) -> None:
@@ -925,6 +1094,9 @@ def spawn_detached(cfg: Config, command: str) -> None:
 
 
 def do_post(cfg: Config, dry: bool = False) -> None:
+    if not dry:
+        # First, before anything touches a device: what changed while asleep.
+        wake_report(cfg)
     order: list[tuple[str, callable]] = []
     if cfg.on("wifi_detach"):
         # Detached: NetworkManager is only told to come back after this hook
@@ -983,7 +1155,7 @@ def cmd_status(cfg: Config) -> int:
     print("switches")
     for key in ("wake_sources", "wifi_detach", "thunderbolt_eject",
                 "cifs_unmount", "defer_on_backup", "silence_force_prompt",
-                "lid_watch", "freeze_sessions"):
+                "lid_watch", "resuspend", "wake_log", "freeze_sessions"):
         print(f"  {key:<18} {cfg.get(key)}")
     print()
     print("wake sources")
@@ -1081,8 +1253,8 @@ def cmd_report(cfg: Config, boot: str) -> int:
                 print(f"    wall clock        : {end - start:.1f}s (includes time asleep)")
             else:
                 print(f"  3 was it a wake     : {'YES' if woke else 'NO'}")
-        print("  4 wake source        : not in the journal; take a snapshot of")
-        print("                         /sys/class/wakeup/*/event_count around the run")
+        print("  4 wake source        : 'wake: counters moved' in the journal,")
+        print("                         logged by post when wake_log is on")
         print()
     return 0
 
