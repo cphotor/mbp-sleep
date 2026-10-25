@@ -2814,3 +2814,59 @@ so there is nothing else to undo.
 **Worked.** No behaviour to work or fail. What the change claims is only that
 the two sentences no longer assert something the measurements contradict, and
 the harness now fails if either sentence comes back.
+
+## C45b — 0.1.2 installed
+
+**When.** 2026-10-26, 00:21:16 to 00:21:17, with the operator's consent given
+for that install.
+
+**Why.** C45 changed two log sentences. It is the only difference between 0.1.1
+and 0.1.2, and the repository release would otherwise sit one message behind the
+machine with nothing on the machine to say so.
+
+**What.** `pkexec ./install.sh` from the repository at `3138a9c`. Only the
+program and the version string changed:
+
+| where | what | evidence |
+|---|---|---|
+| `/usr/local/sbin/mbp-sleep` | 0.1.1 → 0.1.2 | sha256 `3ddf1e1d403049f2931d49e80b2d57503c8aed5fd8f1a9c5e1ca4e148d2f8cfe`, identical to the repository copy; `--version` prints `mbp-sleep 0.1.2` |
+| `/usr/local/share/mbp-sleep/VERSION` | `0.1.1` → `0.1.2` | contents read back as `0.1.2` |
+| `/var/backups/mbp-sleep/20261026-002116/` | what the installer saved first | `mbp-sleep` sha256 `24400faa…` (the 0.1.1 program from C44b), `VERSION` `0.1.1`, plus the three files below |
+| `/etc/systemd/system/mbp-sleep.service`, `/usr/lib/systemd/system-sleep/50-mbp-sleep`, `/etc/systemd/logind.conf.d/50-mbp-sleep.conf` | rewritten, content unchanged | each byte-identical to its copy in the backup directory |
+| `/etc/mbp-sleep.conf` | **not touched** | mtime still 2026-10-25 16:38:00 |
+| `mbp-sleep.service` | restarted | `ActiveEnterTimestamp=Mon 2026-10-26 00:21:17 CST`, `MainPID=425533`, and it logged `started; lid is open; defer_on_backup=on` |
+
+**Where.** `/usr/local/sbin/mbp-sleep` and `/usr/local/share/mbp-sleep/VERSION`.
+Nothing else on the machine differs from before the install.
+
+**Verified so far.** The installed program is byte-identical to the C45 commit,
+`--version` reads `0.1.2`, the service is `active / enabled` and was restarted in
+the same second, and `status` shows the wake sources still enabled (`SPIT`,
+`XHC1`, `LID0`) — the installer re-applies them, and rule 3 is not breached.
+The two reworded sentences have not been seen on the machine: both are printed
+only when a remount attempt fails, and none has been made since the install.
+
+**One thing the installer pointed out, which is older than this change.**
+`/etc/mbp-sleep.conf` does not contain `backup_names` or `cifs_reconnect_wait`,
+so their compiled-in defaults are in force. Both defaults (`borg`, `120`) are the
+values the shipped `macbook.conf` documents, so nothing behaves differently — but
+the two keys are invisible to anyone reading the file. Adding them is a
+configuration change of its own and was not made here.
+
+**Undo.** Restores 0.1.1:
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/20261026-002116/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec install -m 644 -o root -g root \
+    /var/backups/mbp-sleep/20261026-002116/VERSION \
+    /usr/local/share/mbp-sleep/VERSION
+pkexec systemctl restart mbp-sleep.service
+```
+
+The other three files in that backup directory are byte-identical to what is
+installed, so there is nothing else to restore.
+
+**Worked.** The install: yes, measured above. The reworded messages: `not yet
+tested` on the machine; the harness in `scripts/test-cifs-record.py` covers the
+branches that print them.
