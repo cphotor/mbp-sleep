@@ -497,32 +497,78 @@ def cifs_forget() -> None:
         pass
 
 
+def cifs_list(cfg: Config) -> list[str]:
+    """The shares this sleep is responsible for.
+
+    What `pre` recorded, or — if it recorded nothing — what is mounted now.
+    The recorded list is the one that matters: it is taken before the unmounts,
+    so it still names a share that has since disappeared from the mount table.
+    """
+    return cifs_remembered() or cifs_targets(cfg)
+
+
 def cifs_unmount(cfg: Config) -> None:
     table = mount_table()
     fstypes = network_fstypes(cfg)
-    unmounted: list[str] = []
-    for path in cifs_targets(cfg):
-        fstype = table.get(path)
-        if fstype not in fstypes:
-            log(f"cifs: {path} is {fstype or 'not mounted'}, nothing to unmount")
-            continue
+    targets = cifs_targets(cfg)
+    mounted = [path for path in targets if table.get(path) in fstypes]
+    for path in targets:
+        if path not in mounted:
+            log(f"cifs: {path} is {table.get(path) or 'not mounted'}, "
+                f"nothing to unmount")
+    # Record the list *before* touching anything, not after.  This is what went
+    # wrong on 2026-10-25 (C44): `umount /mnt/tmcap2` was killed at its 15 s
+    # timeout, the kernel had already dropped the mount 15 s earlier, and the
+    # list of shares to restore was then rebuilt in `post` from the live mount
+    # table -- which no longer contained tmcap2.  So nothing ever tried to
+    # remount it, and the log claimed "all shares are back".  A share that is
+    # unmounted has to be remembered by the act of deciding to unmount it, not
+    # by the exit code of the command that did it.
+    #
+    # A share that was recorded by an earlier sleep and has still not come back
+    # stays on the list.  Otherwise the next `pre` would rewrite the record with
+    # only what happens to be mounted, and a share that is down *because the
+    # last reconnect failed* would be forgotten exactly when it is the one that
+    # needs retrying -- the same mistake, one sleep later.
+    owed = cifs_remembered()
+    if not cfg.on("cifs_auto"):
+        # With discovery off there is an authoritative list of the shares this
+        # machine wants, so a share removed from the configuration stops being
+        # owed.  With discovery on there is no such list: what was mounted when
+        # the machine went to sleep is the only truth, and the record can only
+        # shrink by a successful remount or a reboot.
+        owed = [path for path in owed if path in targets]
+    for path in mounted:
+        if path not in owed:
+            owed.append(path)
+    if owed:
+        cifs_remember(owed)
+    for path in mounted:
+        fstype = table[path]
         result = run(["umount", path], timeout=cfg.num("cifs_umount_wait", 15))
         if result.returncode == 0:
-            unmounted.append(path)
             log(f"cifs: unmounted {path} ({fstype})")
-        else:
-            # Never lazy-unmount: that leaves the superblock behind, which is
-            # exactly what the kernel then has to sync over a dead link.
-            log(f"cifs: could not unmount {path} rc={result.returncode} "
-                f"{(result.stderr or result.stdout).strip()[:100]}")
-    if unmounted:
-        cifs_remember(unmounted)
+            continue
+        # The exit code is not the answer.  `umount` of a CIFS share on this
+        # machine regularly sits in the socket teardown long after the kernel
+        # has dropped the mount: 2026-10-25 16:41:05, systemd logged
+        # `mnt-tmcap2.mount: Deactivated successfully` in the same millisecond
+        # the command started, and the command still had to be killed 15 s
+        # later.  Ask the mount table instead.
+        if mount_table().get(path) not in fstypes:
+            log(f"cifs: unmounted {path} ({fstype}), although umount exited "
+                f"{result.returncode}; the mount table says it is gone")
+            continue
+        # Never lazy-unmount: that leaves the superblock behind, which is
+        # exactly what the kernel then has to sync over a dead link.
+        log(f"cifs: could not unmount {path} rc={result.returncode} "
+            f"{(result.stderr or result.stdout).strip()[:100]}")
 
 
 def cifs_mount(cfg: Config) -> None:
     table = mount_table()
     fstypes = network_fstypes(cfg)
-    for path in cifs_remembered() or cifs_targets(cfg):
+    for path in cifs_list(cfg):
         fstype = table.get(path)
         if fstype in fstypes:
             continue
@@ -543,9 +589,27 @@ def cifs_mount(cfg: Config) -> None:
 def cifs_satisfied(cfg: Config) -> bool:
     table = mount_table()
     fstypes = network_fstypes(cfg)
-    paths = cifs_remembered() or cifs_targets(cfg)
+    paths = cifs_list(cfg)
     return all(table.get(path) in fstypes or table.get(path) == "autofs"
                for path in paths)
+
+
+def cifs_reconnected(cfg: Config) -> bool:
+    """Report the outcome and forget the record, or say it is not done yet.
+
+    The message names the shares it checked.  The old wording was "all shares
+    are back" whatever the list contained, which on 2026-10-25 announced a
+    restored tmcap2 that had never been remounted (C44).
+    """
+    if not cifs_satisfied(cfg):
+        return False
+    paths = cifs_list(cfg)
+    cifs_forget()
+    if paths:
+        log(f"cifs: all shares are back ({', '.join(paths)})")
+    else:
+        log("cifs: no network shares to restore")
+    return True
 
 
 def cifs_reconnect(cfg: Config) -> None:
@@ -560,18 +624,19 @@ def cifs_reconnect(cfg: Config) -> None:
     deadline = time.monotonic() + cfg.num("cifs_reconnect_wait", 120)
     delay = 3
     while time.monotonic() < deadline:
-        if cifs_satisfied(cfg):
-            cifs_forget()
-            log("cifs: all shares are back")
+        if cifs_reconnected(cfg):
             return
         cifs_mount(cfg)
-        if cifs_satisfied(cfg):
-            cifs_forget()
-            log("cifs: all shares are back")
+        if cifs_reconnected(cfg):
             return
         time.sleep(delay)
         delay = min(delay * 2, 30)
+    table = mount_table()
+    fstypes = network_fstypes(cfg)
+    down = [path for path in cifs_list(cfg)
+            if table.get(path) not in fstypes and table.get(path) != "autofs"]
     log(f"cifs: gave up after {cfg.num('cifs_reconnect_wait', 120)} s; "
+        f"still down: {', '.join(down) or 'nothing recorded'}; "
         f"the shares will come back when something touches them")
 
 

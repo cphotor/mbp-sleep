@@ -2578,3 +2578,95 @@ behaviour without reinstalling anything.
 
 **Worked.** Partly. Installed and running, and resume detection exercised; the
 self-wake re-suspend, which is the point of C43, is still `not yet tested`.
+
+## C44 — the record of shares to remount is written before the unmount, and `umount`'s exit code is not believed
+
+**When.** 2026-10-25, from 23:30. Repository change only; the install and the
+sleep test that follow it are for C44b. One machine action was taken first, and
+is recorded below because it changed the machine: at 23:27:17
+`pkexec systemctl start mnt-tmcap2.mount` returned 0 and `findmnt` then showed
+`//syncs.asuscomm.com/tmcap2` on `/mnt/tmcap2`; at 23:32 both shares were
+mounted. That action is not part of the fix and needs no undo (a reboot, or the
+automount's own idle timeout, returns the machine to the same state).
+
+**Why.** On four resumes the machine lost `/mnt/tmcap2` and the log said the
+shares were back. The 16:41 cycle is the clearest, and it is one defect in two
+halves:
+
+| time | journal | what it means |
+|---|---|---|
+| 16:41:05.796 | `cifs: could not unmount /mnt/pastime rc=32` (target busy) | pastime really was still mounted, so it was not recorded |
+| 16:41:05.799 | systemd: `mnt-tmcap2.mount: Deactivated successfully` | the kernel dropped tmcap2 three milliseconds later |
+| 16:41:20.799 | `cifs: could not unmount /mnt/tmcap2 rc=124 timed out after 15s` | the `umount` *command* was killed in the socket teardown, 15 s after the mount it was asked to remove had already gone |
+| — | `/run/mbp-sleep/network-unmounted` was never written in that boot | both unmounts "failed", and the old code only recorded the ones that returned 0 |
+| 16:56:30.260 → .407 | `cifs-reconnect` started, then `cifs: all shares are back` | 0.14 s: the list `post` checked was rebuilt from the live mount table, which by then contained only pastime |
+| — | no `cifs: started mnt-tmcap2.mount` anywhere in the boot | nothing ever tried to remount it |
+
+Two design faults, one in each half. The exit code of `umount` was treated as
+the fact, although on a CIFS share it is the exit code of a process that can
+hang after the mount is gone. And the list of shares to restore was derived
+*after* the fact from `/proc/mounts`, which cannot name a share that has
+already disappeared — so the one share that needed putting back was exactly the
+one the list could not contain.
+
+This is not a one-off: the same three lines appear at 2026-10-23 05:56 and
+19:45 and at 2026-10-25 14:04 and 16:41. The 2026-10-23 19:45 case left
+`/mnt/tmcap2` unmounted until 2026-10-24 00:16:21 — 4 h 31 min — even though a
+reconnect ran at 23:22:15 and said all shares were back; its
+`systemctl start mnt-tmcap2.mount` had failed at 23:22:13 and, because the share
+was not in the record, nothing tried again.
+
+**What.**
+
+| file | change |
+|---|---|
+| `mbp-sleep` | `cifs_unmount()` records every share it is about to unmount **before** the first `umount`, keeps any share an earlier sleep still owes, and — when `umount` returns non-zero — asks `mount_table()` again instead of believing it: a path that is gone is logged as unmounted "although umount exited N". With `cifs_auto = off` the record is trimmed to the configured shares, so a share removed from the configuration stops being owed. New `cifs_list()` is the one place that answers "which shares does this sleep care about" (record first, live table only as a fallback). New `cifs_reconnected()` prints `all shares are back (/mnt/pastime, /mnt/tmcap2)` — the shares it actually checked — or `no network shares to restore`; `cifs_reconnect()` logs `still down: …` when it gives up, instead of only that it gave up. |
+| `scripts/test-cifs-record.py` | new: six scenarios against a made-up mount table, no root and no share. It reproduces rc=124 with the mount already gone, rc=32 with the mount still there, a share left over from a failed reconnect, `cifs_auto = off`, "no shares at all", and the give-up message. |
+| `README.md` | the network-filesystem section says when the record is written, that a failed `umount` is checked rather than believed, and names the test script. |
+| `CHANGELOG.md` | two entries under *Unreleased / Fixed*. |
+
+**Where.** The repository, until C44b installs it: `mbp-sleep` sha256
+`24400faad2374f386df41c29de7d63387359bb8777384f343bb74d8098499531`,
+`scripts/test-cifs-record.py` sha256
+`639118c09763676b2acece3a967d54d1b37fb7bcad58ee114970e7c2401dd21d`.
+No configuration key is added or changed, so `/etc/mbp-sleep.conf` is not
+touched.
+
+**Verified so far.** The program compiles and `scripts/test-cifs-record.py`
+passes 6/6. The harness was also run against the **previous** program
+(`8315b5b`), which reproduces the defect exactly — `cifs: could not unmount
+/mnt/tmcap2 rc=124 timed out after 15s` with the record left as
+`['/mnt/pastime']`, which is what the 16:41 boot did — and the new program
+against the same input logs
+`unmounted /mnt/tmcap2 (cifs), although umount exited 124; the mount table says
+it is gone`, records both shares, remounts tmcap2 and prints
+`all shares are back (/mnt/pastime, /mnt/tmcap2)`.
+**No sleep has been exercised with this code.** The harness proves the decision
+logic, not the machine.
+
+**Known limits of the fix, stated so nobody has to discover them again.** The
+record can survive a reboot-free boot forever if a recorded share can never be
+mounted again (its unit deleted while the machine stays up): every resume then
+spends `cifs_reconnect_wait` and logs `gave up`. With discovery on there is no
+authoritative list of wanted shares to prune against, and inventing one would
+mean compiling share names into the program, which C36 deliberately removed. A
+reboot clears `/run/mbp-sleep` and with it the record.
+
+**Undo.** `install.sh` backs up the program it replaces; the file to put back is
+the one installed now:
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/<timestamp>/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec systemctl restart mbp-sleep.service
+```
+
+where `<timestamp>` is the directory `install.sh` printed; its `mbp-sleep` must
+have sha256 `2f7c31b408d7e97e6607894ab93f669015f1976411ff34829e710760d72204e6`.
+To undo only the repository side, `git revert` the C44 commit. Nothing outside
+`/usr/local/sbin/mbp-sleep` and the repository is changed, so nothing else needs
+undoing; `/run/mbp-sleep/network-unmounted` is runtime state and can be deleted
+at any time.
+
+**Worked.** Not yet tested on the machine. The next real sleep whose `umount`
+is cut off at the timeout is the test, and C44b records it.

@@ -31,6 +31,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader to take a snapshot by hand.
 - `macbook.conf` grew sections 7 (self-wake) and 8 (the session freeze, was 7).
 
+### Fixed
+
+- **A share whose `umount` was killed at the timeout was never remounted.**
+  `umount /mnt/tmcap2` was killed at its 15 s timeout *after* the kernel had
+  dropped the mount — systemd logged `mnt-tmcap2.mount: Deactivated
+  successfully` in the same millisecond the command started. The exit code was
+  read as "still mounted", so the share never entered the record of what to put
+  back; `post` then rebuilt that record from the live mount table, which no
+  longer named it, and announced `cifs: all shares are back` 0.14 s later over
+  the shares that were left. The record is now written **before** the first
+  unmount, and a failed `umount` is checked against the mount table instead of
+  believed. Observed four times (2026-10-23 05:56 and 19:45, 2026-10-25 14:04
+  and 16:41); the 2026-10-23 case left `/mnt/tmcap2` down for 4 h 31 min.
+- **The CIFS messages name the shares they checked.** `all shares are back`
+  now lists them, `gave up` lists the ones still down, and a share that is
+  still owed stays in the record for the next sleep instead of being forgotten
+  by the next `pre`.
+
 ## [0.1.1] - 2026-10-20
 
 ### Fixed

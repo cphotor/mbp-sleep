@@ -171,6 +171,19 @@ An idle `x-systemd.automount` share is invisible to this: its mount point
 carries `autofs`, not `cifs`, so it is left alone and comes back the next time
 something touches it.
 
+What to remount is decided **before** the first unmount, not after the last one:
+`pre` writes the shares it is about to take down to
+`/run/mbp-sleep/network-unmounted`, and `post` restores that list and nothing
+else. A non-zero `umount` is not believed either — the mount table is asked
+again, because on this machine `umount` of a CIFS share is routinely killed at
+the 15 s timeout *after* the kernel has already dropped the mount. A share that
+is recorded and does not come back stays recorded, so the next sleep tries it
+again, and `status` prints it as `was unmounted for sleep, not back yet`.
+
+`scripts/test-cifs-record.py` exercises that whole decision against a made-up
+mount table: no root, no share, and it reproduces the exit code that caused the
+2026-10-25 miss (`docs/config-changes.md`, C44).
+
 ### Backups
 
 | key | default | meaning |
