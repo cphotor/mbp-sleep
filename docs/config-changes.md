@@ -2526,3 +2526,55 @@ install and the sleep test have not happened yet, and C43b records them.
 **Rule 3.** Not breached. No wake source is disabled or removed: `LID0`,
 `SPIT` and `XHC1` stay enabled. The change only decides to sleep again after a
 wake nobody asked for.
+
+## C43b — C43 was installed after all: the program, and the four configuration keys
+
+**When.** 2026-10-25, 16:37:19 to 16:38:43. This entry was written at 23:40 the
+same day, after the fact.
+
+**Why.** C43 ends with "Not yet tested — the change is written into the
+repository only; the install and the sleep test have not happened yet, and C43b
+records them." The install *did* happen, sixteen minutes after C43 was
+committed, and nothing recorded it. As written, C43 tells a reader that this
+machine still runs the C41 program. It does not. C43 itself is not edited
+(rule 5: append, never edit), so this entry is the correction.
+
+**What.** No source change; nothing here is new behaviour, it is the install of C43.
+
+| where | what | evidence |
+|---|---|---|
+| `/usr/local/sbin/mbp-sleep` | replaced with the C43 program | mtime 16:37:19, sha256 `2f7c31b408d7e97e6607894ab93f669015f1976411ff34829e710760d72204e6`, identical to `git show 8315b5b:mbp-sleep` |
+| `/etc/mbp-sleep.conf` | `resuspend`, `resuspend_delay`, `resuspend_max`, `wake_log` added, by hand | mtime 16:38:00; the keys are at lines 120-123 with the values `on`, `10`, `3`, `on` |
+| `/var/backups/mbp-sleep/20261025-163719/` | what the installer saved before writing | `mbp-sleep` sha256 `ba0bc6ea…` (= `git show a94e1b1:mbp-sleep`, the program C41 installed); `mbp-sleep.conf.before-c43` sha256 `6e66daba…` |
+| `/etc/systemd/system/mbp-sleep.service`, `/usr/lib/systemd/system-sleep/50-mbp-sleep` | rewritten by `install.sh`, content unchanged | both mtime 16:37:19, sha256 identical to the copies in the backup directory |
+| `mbp-sleep.service` | restarted | `ActiveEnterTimestamp=Sun 2026-10-25 16:38:43 CST` |
+
+**Where.** `/usr/local/sbin/mbp-sleep`, `/etc/mbp-sleep.conf`, plus the two
+units that `install.sh` rewrites from the same source.
+
+**Verified so far.** The installed file is byte-identical to `8315b5b`, so the
+program on the machine is C43 and nothing else. The daemon then logged
+`resume: 896s of sleep; lid is open` at 16:56:28 for the sleep it requested at
+16:41:04, which is `detect_resume()` doing exactly what C43 says — the
+`CLOCK_BOOTTIME` difference, named in seconds, once per resume. **The
+re-suspend path has not been exercised**: every resume since the install found
+the lid open, so `maybe_resuspend()` has never had to send the machine back to
+sleep.
+
+**Undo.** Restores both files to their pre-C43 content and restarts the daemon:
+
+```sh
+pkexec install -m 755 -o root -g root \
+    /var/backups/mbp-sleep/20261025-163719/mbp-sleep /usr/local/sbin/mbp-sleep
+pkexec install -m 644 -o root -g root \
+    /var/backups/mbp-sleep/20261025-163719/mbp-sleep.conf.before-c43 \
+    /etc/mbp-sleep.conf
+pkexec systemctl restart mbp-sleep.service
+```
+
+Nothing has been added to `/etc/mbp-sleep.conf` since 16:38, so restoring that
+backup loses no later setting. `resuspend = off` alone would also stop the new
+behaviour without reinstalling anything.
+
+**Worked.** Partly. Installed and running, and resume detection exercised; the
+self-wake re-suspend, which is the point of C43, is still `not yet tested`.
