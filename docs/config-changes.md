@@ -2870,3 +2870,84 @@ installed, so there is nothing else to restore.
 **Worked.** The install: yes, measured above. The reworded messages: `not yet
 tested` on the machine; the harness in `scripts/test-cifs-record.py` covers the
 branches that print them.
+
+## C46 — Vorta waits for the share instead of reporting it missing
+
+**When.** 2026-11-12 00:36. The machine already runs 0.1.2 (C45b); this entry
+adds a user-side helper and one Vorta profile setting, not a new program.
+
+**Why.** On 2026-11-11 the machine resumed at 23:40:28 after 187413 s of sleep.
+`post` started the detached cifs-reconnect; the first three mount attempts failed
+while Wi-Fi was still down, `wifi: wlan0 is connected` was logged at 23:40:35,
+and `cifs: all shares are back (/mnt/tmcap2)` at 23:40:41. Vorta ran its
+catch-up backup at 23:40:31 — 3 s after resume, 10 s before the share existed —
+and logged:
+
+```
+23:40:31 Conditions for backup not met. Aborting.
+23:40:31 Repo folder not mounted or moved.
+23:40:31 vorta.notifications - DEBUG - notification not suppressed
+```
+
+That is the "backup disk" notification. The same sequence appears in Vorta's
+logs on 2026-10-31, 11-01, 11-03, 11-04, 11-05 (five times), 11-06, 11-09 (twice)
+and 11-11. It is not a data-loss failure: Vorta paused for 10 minutes and the
+backup ran at 23:50.
+
+The cause is ordering, not a broken remount. mbp-sleep unmounts the shares
+before sleep, and NetworkManager is only told to come back after the sleep hook
+returns and logind announces the resume — which is also when Vorta's catch-up
+starts. Waiting inside the hook is the thing C4 and C40 rejected: it runs inside
+the sleep transaction and delays the resume of every user on the machine.
+
+**What.**
+
+| file / setting | change |
+|---|---|
+| `scripts/wait-for-share.sh` | new. Exit 0 as soon as `<path>` is a `cifs`/`smb3`/`smbfs` mount, 1 after `<seconds>` (default 60). |
+| Vorta profile `Default`, `pre_backup_cmd` in `~/.local/share/Vorta/settings.db`, table `backupprofilemodel`, id 1 | empty → `/home/hexin/sync/projects/mbp-sleep/scripts/wait-for-share.sh /mnt/tmcap2 60` |
+
+Vorta runs `pre_backup_cmd` before it checks that the repository path exists
+(`vorta/borg/create.py:141` before `:145`), so the catch-up waits for the
+remount and then proceeds. The command also runs for every ordinary backup, but
+returns in about 0 s when the share is already mounted. `schedule_make_up_missed`
+was left `1`: a missed backup still runs at wake, it just waits for the share
+first.
+
+**Where.** `scripts/wait-for-share.sh` in the repository, and that one column in
+Vorta's settings DB. The DB was snapshotted first with
+`sqlite3 settings.db ".backup settings.db.bak-20261112-003136"`; the snapshot
+contains the same latest eventlog row (406) as the live DB. Both files are mode
+`0600`, like the live DB.
+
+**Verified so far.** Script: exits 0 immediately on the mounted `/mnt/tmcap2`;
+exits 1 after 2 s on `/tmp` and on a missing path. Vorta's exact command
+(`sh -c '… /mnt/tmcap2 60'`) returns 0 while mounted. The setting is read on
+every `create_backup` (`BackupProfileModel.get_or_none`), so Vorta does not need
+a restart. The race itself is **not yet tested** on the machine: it only occurs
+at a wake that triggers a Vorta catch-up.
+
+**Undo.**
+
+```sh
+sqlite3 ~/.local/share/Vorta/settings.db \
+    "update backupprofilemodel set pre_backup_cmd='' where id=1;"
+rm ~/sync/projects/mbp-sleep/scripts/wait-for-share.sh
+```
+
+Or, with Vorta stopped, restore `~/.local/share/Vorta/settings.db.bak-20261112-003136`.
+
+**Worked.** `not yet tested` on the machine. Only the script's branches have been
+exercised; whether the notification stops requires a real resume.
+
+**Two related things seen while measuring, not changed here.**
+
+1. `borg-backup.timer` has `Persistent=true`, so it also catches up at resume.
+   At 23:40:28 it started, saw `/mnt/tmcap2` not mounted, and exited through its
+   guard: `/var/log/borg-backup.log` records that the share was not a cifs mount
+   (the current filesystem was the ext4 root), so the run was skipped (exit 2,
+   counted as success). It does not notify; the next hourly run covers it.
+2. The 00:15:45 `borg-backup.service` run then waited its full `--lock-wait=900`
+   and skipped at 00:30:58 because Vorta's post-backup `borg check` (started
+   23:53:43) still held the repository lock. That is a scheduling collision
+   between the two backup systems, unrelated to resume.
