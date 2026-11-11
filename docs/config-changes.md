@@ -2982,3 +2982,32 @@ exercised, because the share never came back. C46's `Worked` therefore stays
 resolves, `/mnt/tmcap2` mounted at 00:54:12, `mbp-sleep status` shows
 `wifi wlan0 present, connected`. The kernel update was pending before the test
 and the reboot finished it; this is unrelated to C46.
+
+## C46b — the second wake test had a healthy remount, but Vorta was paused (a test, not a change)
+
+**When.** 2026-11-12 01:00:34 to 01:04.
+
+**What happened.** Suspend at 01:00:34, resume at 01:00:57 (`resume: 2s of
+sleep; lid is open`). Wi-Fi activated at 01:01:04 and cifs-reconnect's third
+attempt mounted the share at 01:01:10 (`cifs: all shares are back
+(/mnt/tmcap2)`). The resume path is healthy on 7.2.15; the C46a module problem
+is gone.
+
+Vorta received the resume at 01:01:00 but did not start a catch-up: it was still
+paused until 01:03:36 by the 00:52:36 failure (`Nothing scheduled for profile 1
+because of timeout until 2026-11-12 01:03:36`). So the race was not exercised
+this time either.
+
+At 01:03:37 the pause expired and the catch-up started with the share already
+mounted. `Preparation for backup successful` was logged 0.18 s after
+`Starting background backup` (01:03:37.802 → 01:03:37.985), i.e. the pre-backup
+command returned immediately, and `borg create` began at 01:03:38. That confirms
+the already-mounted path adds no delay and no error notification, but it is not
+the race.
+
+**Still to test.** A wake after a scheduled time that passed during sleep, with
+no pause active — the original failure shape. The next scheduled run is
+02:03:37; a sleep spanning it and a wake after it will exercise the path.
+
+**Worked.** `not yet tested` for the success path; the timeout path is measured
+in C46a and the already-mounted path here.
