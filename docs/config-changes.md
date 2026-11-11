@@ -2951,3 +2951,34 @@ exercised; whether the notification stops requires a real resume.
    and skipped at 00:30:58 because Vorta's post-backup `borg check` (started
    23:53:43) still held the repository lock. That is a scheduling collision
    between the two backup systems, unrelated to resume.
+
+## C46a — the first wake test did not reach the race (a test, not a change)
+
+**When.** 2026-11-12 00:37:45 to 00:53:49.
+
+**What happened.** A suspend/resume cycle ran at 00:37:45 and woke at 00:37:51
+(`resume: 2s of sleep; lid is open`). Wi-Fi did not come back:
+`wifi: could not unload brcmfmac: modprobe: FATAL: Module brcmfmac not found`
+and, in `wifi-verify`, `modprobe brcmfmac failed: modprobe: FATAL: Module
+brcmfmac not found in directory /lib/modules/7.2.14-arch1-1`. The machine had
+linux 7.2.15 installed while still running 7.2.14, so the running kernel's
+module tree was gone. Without Wi-Fi, cifs-reconnect could not mount: seven
+attempts, then `cifs: gave up after 120 s; still down: /mnt/tmcap2; the next
+sleep will try again` at 00:40:09. The share stayed down until the reboot.
+
+**What the test did prove.** Vorta's 00:52:36 scheduled backup ran the new
+pre-backup command and it waited the **full 60 s** (00:52:36 → 00:53:36) before
+returning 1. Vorta then logged `Pre-backup command returned non-zero exit code.`
+and paused the profile. That is the timeout branch working as designed: it
+reported the true cause (a share that had been down for 12 minutes) instead of
+the old 3-second `Repo folder not mounted or moved.`
+
+**What it did not prove.** The intended path — share back in about 13 s, the
+wait returns 0, the catch-up proceeds with no error notification — was not
+exercised, because the share never came back. C46's `Worked` therefore stays
+`not yet tested` for the success path; only the timeout path is measured.
+
+**State afterwards.** Rebooted at 00:53:49 into 7.2.15; `modinfo brcmfmac`
+resolves, `/mnt/tmcap2` mounted at 00:54:12, `mbp-sleep status` shows
+`wifi wlan0 present, connected`. The kernel update was pending before the test
+and the reboot finished it; this is unrelated to C46.
