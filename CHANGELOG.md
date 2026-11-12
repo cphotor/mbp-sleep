@@ -4,18 +4,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.3] - 2026-11-12
-
-### Changed
-
-- **No program change. This version marks the C46 revert.** A
-  `scripts/wait-for-share.sh` helper for Vorta's `pre_backup_cmd` was added
-  (C46) and reverted (C46c) the same day: waiting in Vorta's main-thread loop
-  left Vorta wedged when mbp-sleep re-suspended the machine during the wait.
-  `mbp-sleep` itself is byte-identical to 0.1.2, so nothing on the machine
-  needs reinstalling. The investigation is in `docs/config-changes.md` C46,
-  C46a, C46b and C46c.
-
 ## [0.1.2] - 2026-10-26
 
 ### Added
