@@ -3011,3 +3011,79 @@ no pause active — the original failure shape. The next scheduled run is
 
 **Worked.** `not yet tested` for the success path; the timeout path is measured
 in C46a and the already-mounted path here.
+
+## C46c — C46 reverted: the wait let Vorta wedge when the machine re-suspended
+
+**When.** 2026-11-12 19:43. Operator chose this over keeping the wait.
+
+**Why.** C46 assumed the machine stays awake while `pre_backup_cmd` waits.
+`resuspend` breaks that assumption, and the combination wedged Vorta:
+
+- 18:51:48 the machine woke on its own with the lid closed after 62789 s of
+  sleep; `resuspend` scheduled a re-suspend in 10 s.
+- 18:51:51.407 Vorta started its catch-up (`Catching up by running job for
+  Default`). `BorgCreateJob.prepare()` runs the pre-backup command in the main
+  thread as `while proc.poll() is None: QCoreApplication.processEvents()`
+  (`vorta/borg/create.py:77-82`, called from `scheduler.py:574`), so Vorta was
+  inside that loop when the machine suspended at 18:51:59 — 8 s into a 60 s
+  wait.
+- 19:18:51 the lid opened and the machine woke for good. Vorta never came back.
+  Its log stops at 18:51:51.433, and it did not log `Got login suspend/resume
+  notification` for the 19:18:51 resume, although it logged that line for every
+  earlier resume (00:37:54, 01:01:00, 01:11:53, 01:15:39). The wait script was
+  left as a zombie (`[wait-for-share.] <defunct>`, parent Vorta) for the next
+  34 minutes — impossible while the `proc.poll()` loop is running — and the
+  process had no job thread; its main thread sat in `futex_do_wait`.
+
+The direct fault is Vorta's: it does not survive a suspend in the middle of that
+wait loop. The script itself exited on time; its 60 s deadline used wall clock,
+so the 26-minute sleep consumed it. The window belongs to C46, though: without
+the wait the repository check ends in about 3 s, long before the 10 s
+re-suspend. The wait is what put Vorta in the suspend's way.
+
+**What.**
+
+| where | change |
+|---|---|
+| Vorta profile `Default`, `~/.local/share/Vorta/settings.db`, table `backupprofilemodel`, id 1 | `pre_backup_cmd` back to its pre-C46 empty value; `schedule_make_up_missed` 1 → 0 |
+| `scripts/wait-for-share.sh` | deleted from the tree; recoverable from commit f8e65f0 |
+| `CHANGELOG.md` | the Unreleased entry for the script removed: the change never shipped |
+
+`schedule_make_up_missed = 0` is the part that removes the notification for
+good: Vorta no longer starts a catch-up on the resume signal, so the 3 s check
+versus 13 s remount race cannot happen. A run missed while the machine slept is
+scheduled from the current time at the next interval boundary
+(`scheduler.py:444-455`), i.e. it waits for an hour in which the machine is
+awake. That delay is the accepted cost.
+
+The stuck Vorta was stopped with `SIGTERM` and started again at 19:43:51; no
+borg job was running at the time.
+
+**Where.** One row in Vorta's settings DB and the repository. The snapshot taken
+immediately before the edit is `settings.db.bak-20261112-194310` (mode 0600);
+it still holds the C46 values.
+
+**Verified.** DB readback: `1|Default|0|''`. The restarted Vorta logged
+`Scheduling next run for 2026-11-12 20:11:15` and did **not** start a catch-up —
+with the old setting it would have caught up on the 02:11 miss immediately. No
+borg process was running afterwards.
+
+**Undo.**
+
+```sh
+sqlite3 ~/.local/share/Vorta/settings.db \
+    "update backupprofilemodel set schedule_make_up_missed=1, pre_backup_cmd='/home/hexin/sync/projects/mbp-sleep/scripts/wait-for-share.sh /mnt/tmcap2 60' where id=1;"
+git show f8e65f0:scripts/wait-for-share.sh > scripts/wait-for-share.sh
+chmod 755 scripts/wait-for-share.sh
+```
+
+Or, with Vorta stopped, restore `~/.local/share/Vorta/settings.db.bak-20261112-194310`.
+
+**Worked.** `not yet tested` for the behaviour that matters: a real wake after a
+scheduled time has passed must now produce no catch-up and no notification. The
+DB change, the restart and the absence of a catch-up at restart are measured
+above.
+
+**C46's own claim.** Its `Worked` stays `not yet tested` and is now moot: the
+success path was never exercised, and the one wake that reached the wait wedged
+Vorta instead.

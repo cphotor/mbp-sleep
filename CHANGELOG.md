@@ -4,23 +4,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- **`scripts/wait-for-share.sh`, so a backup tool can wait out the resume race
-  instead of failing.** mbp-sleep unmounts the CIFS shares before sleep and
-  remounts them from a transient unit, but NetworkManager is only told to come
-  back after the sleep hook returns. Vorta starts a missed backup on that same
-  resume signal, 3 s after waking, and on 2026-11-11 23:40 it checked the
-  repository path 10 s before the share came back, aborted with `Repo folder not
-  mounted or moved.` and delivered an error notification. The script is meant
-  for Vorta's `pre_backup_cmd`: it returns as soon as `/mnt/tmcap2` is a cifs
-  mount, or fails after the timeout, and Vorta runs it before its
-  repository-exists check. Waiting inside the sleep hook was rejected in C4 and
-  C40 because it delays the resume of every user. See `docs/config-changes.md`
-  C46.
-
 ## [0.1.2] - 2026-10-26
 
 ### Added
