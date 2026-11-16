@@ -3087,3 +3087,93 @@ above.
 **C46's own claim.** Its `Worked` stays `not yet tested` and is now moot: the
 success path was never exercised, and the one wake that reached the wait wedged
 Vorta instead.
+
+## C46d — the C46c revert measured: six wakes, no catch-up, no notification
+
+**When.** 2026-11-16 23:40, recorded from the journal and Vorta's rotated logs.
+No change was made; this is the measurement C46c left as `not yet tested`.
+
+**Why.** C46c claimed that `schedule_make_up_missed = 0` turns the wake into a
+plain reschedule: no catch-up job, so no `Repo folder not mounted or moved.`
+notification, and no Vorta main-thread wait for the machine to suspend in the
+middle of. The four long sleeps of 11-12 → 11-16 woke six times while asleep
+past a scheduled 11:15 hourly boundary, which is the exact case.
+
+**Measured.** Every wake logged the resume signal and then a reschedule, and
+none logged a catch-up:
+
+| wake (lid closed unless noted) | Vorta line after the resume signal |
+|---|---|
+| 11-12 19:52:19 | `Scheduling next run for 2026-11-12 20:11:15` |
+| 11-13 22:54:49 / 22:55:07 | `Scheduling next run for 2026-11-13 23:11:15` |
+| 11-15 15:07:41 / 15:08:03 | `Scheduling next run for 2026-11-15 15:11:15` |
+| 11-15 16:27:13 | `Scheduling next run for 2026-11-15 17:11:15` |
+| 11-16 00:48:19 / 00:48:38 | `Scheduling next run for 2026-11-16 01:11:15` |
+| 11-16 22:20:21 (lid opened) | `Scheduling next run for 2026-11-16 23:11:15` |
+
+`grep "Catching up"` over `vorta.2026-11-1[2-6].log` and `vorta.log` finds its
+last occurrence at 2026-11-12 18:51:51.407 — the pre-revert wedge in C46c — and
+nothing after. No error notification was delivered.
+
+The 11-16 22:20 wake also shows what the catch-up used to trip over: the CIFS
+mount failed twice at 22:20:19, Wi-Fi associated at 22:20:27, and
+`Mounted /mnt/tmcap2` at 22:20:31 — 12 s after the resume. Vorta no longer looks
+at the repository during that window.
+
+**The cost, measured.** After the 22:20 wake the next Vorta run was at
+23:11:16, and it succeeded (`Starting background backup`, `Preparation for
+backup successful`, `Backup creation successful` at 23:15:19). But between the
+11-12 20:11 boundary and 23:11 on 11-16 the machine was asleep at every hourly
+boundary, so Vorta ran no backup at all for four days. The root
+`borg-backup.timer` behaved the same way: it skipped at each wake because the
+share was not mounted yet (the guard exits and logs that the share is not a
+cifs mount; it is a skip, not a failure) and made up the run at 23:15:47,
+finishing 23:18:04 with 31 archives. Missed runs
+therefore wait for an awake boundary, which can be days away on a machine that
+sleeps for days; that is the accepted price of dropping the catch-up.
+
+**Undo.** None: this entry changes nothing. Its evidence is the journal of boot
+0 and `~/.local/state/Vorta/log/vorta*.log`.
+
+**Worked.** Yes, for the claim C46c makes: no catch-up and no notification at
+six wakes that missed a scheduled time. C46c's `Worked` is left as written;
+this entry is the measurement it was waiting for.
+
+## C43c — the self-wake re-suspend is now exercised: four long sleeps, four holds
+
+**When.** 2026-11-16 23:40, recorded from the journal of boot 0. No change was
+made; this closes the `not yet tested` in C43's and C43b's `Worked` lines.
+
+**Why.** C43 added `resuspend`: when a resume finds the lid still closed, the
+daemon sleeps again, up to three attempts. C43's `Worked` said the re-suspend
+itself was unmeasured, and C43b repeated that.
+
+**Measured.** Four unattended wakes with the lid shut, each after hours or days
+of sleep:
+
+| woke | sleep before it | attempts | what held |
+|---|---|---|---|
+| 11-12 18:51:48 | 62789 s | 3 | attempt 3 slept 1577 s until the lid opened |
+| 11-13 22:54:47 | 97329 s | 3 | attempt 3 slept 144736 s |
+| 11-15 15:07:39 | 144736 s | 3 | attempt 3 slept 4739 s |
+| 11-16 00:48:16 | 28280 s | 3 | attempt 3 slept 77476 s |
+
+The shape was identical every time: attempt 1 slept 2-3 s and woke, attempt 2
+slept 2-3 s and woke, attempt 3 held for the rest of the lid-closed period. The
+machine never stayed awake with the lid shut, which is the failure C43 was
+written for. All four wakes carried the same counter signature
+(`gpe4E` +274…+415, `wakeup36(PNP0C0C:00)` +2, `wakeup3(device:6b)` +1,
+`wakeup35(PNP0C0C:00)` +1, `wakeup40(0000:00:14.0)` +1, `wakeup44(1-3)` +1,
+`wakeup6(device:0d)` +1, `gpe4D`/`gpe52`/`gpe6D` +1), so the unidentified
+self-wake of `docs/background.md` is reproducible, not random. Its source is
+still not attributed.
+
+**Not measured.** What the daemon does when all three attempts wake early and
+the budget is spent. Three attempts have always been enough so far.
+
+**Undo.** None: this entry changes nothing. The evidence is boot 0's journal
+(`resume:` / `resuspend:` lines from `mbp-sleep`) and `mbp-sleep report --boot 0`.
+
+**Worked.** Yes, for the re-suspend: exercised four times, held four times. The
+`not yet tested` wording in C43 and C43b stands as the state at the time they
+were written; this entry supersedes it.
