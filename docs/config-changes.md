@@ -3177,3 +3177,73 @@ the budget is spent. Three attempts have always been enough so far.
 **Worked.** Yes, for the re-suspend: exercised four times, held four times. The
 `not yet tested` wording in C43 and C43b stands as the state at the time they
 were written; this entry supersedes it.
+
+## C43d — 61 hours asleep with the Ethernet adapter attached: resuspend held on attempt 1, and ens9 came back by itself
+
+**When.** 2026-11-19 13:50, recorded from the journal of boot 0. No change was
+made. This is the measurement C43c could not provide: a multi-day sleep with
+the Thunderbolt adapter plugged in.
+
+**Why.** Before 2026-11-16 the adapter was absent during every long sleep, so
+the hook logged `thunderbolt: adapter not enumerated, nothing to do` and
+`thunderbolt_eject` never had an endpoint to remove or re-authorise. The
+adapter only enumerated after the 2026-11-16 reboot to 7.3.4, which was needed
+because `tg3` did not exist for the running 7.2.15 kernel. The operator left it
+attached through two long sleeps.
+
+**Measured.**
+
+| sleep | entered | woke | duration | how it ended |
+|---|---|---|---|---|
+| 1 | 11-17 00:17:41 | 11-17 12:39:41 | 44511 s (12 h 22 min) | self-wake with the lid closed; `resuspend` attempt 1 put it back to sleep |
+| 2 | 11-17 12:39:53 | 11-19 13:46:02 | 176756 s (49 h 6 min) | `Lid opened.` |
+
+Both cycles report `did it sleep: YES` and `was it a wake: YES`. The machine was
+asleep for 221267 s of the 221777 s between the 11-17 00:08 resume and the 11-19
+13:46 one.
+
+- **Attempt 1 held.** The 12:39:41 wake was followed by one re-suspend
+  (`attempt 1/3`) and 49 hours of sleep. Earlier self-wakes needed three
+  attempts, so the attempt count is not fixed; no cycle has ever reached 3/3.
+- **Same wake signature.** `gpe4E +418`, `wakeup39(PNP0C0C:00)` +2,
+  `wakeup3(device:6b)` +1, `wakeup38(PNP0C0C:00)` +1, `wakeup43(0000:00:14.0)`
+  +1, `wakeup47(1-3)` +1, `wakeup6(device:0d)` +1, `gpe4D`/`gpe52`/`gpe6D` +1.
+  These are the same counters as C43c, with every number shifted because the
+  adapter added two `/sys/class/wakeup` entries.
+- **The adapter restored itself at both wakes.** `0-1 authorized=1` about 2 s
+  after the resume signal, `tg3 ... ens9: renamed from eth0` about 3 s,
+  `Link is up at 1000 Mbps, full duplex` about 6 s, and the DHCP lease back at
+  `172.16.0.102`. The eject/re-authorise path survived two full cycles with no
+  manual step.
+- **The share came back in 46 s at the 13:46 wake.** The first mount attempt
+  began at 13:46:05, before Wi-Fi had associated, and hit the CIFS 45 s timeout
+  at 13:46:48; the retry at the same second succeeded. The equivalent remount
+  after the 11-17 00:08 wake took 12 s. Both are the known resume race, now
+  absorbed by the retry loop rather than by Vorta waiting.
+- **Both backup systems recovered on their own.** `borg-backup.timer` is
+  `Persistent=true`, so it caught up at 13:46:48; that first invocation found
+  the share not yet cifs and skipped, the second at 13:46:49 ran and finished at
+  13:47:04 with 31 archives. Vorta logged the 13:46:05 resume signal and only
+  rescheduled to 14:17:14, with no catch-up and no notification — C46d again.
+- **Deferral worked.** The lid was closed at 11-17 00:17:09 while a Vorta backup
+  was running; the daemon logged `deferred until the backup ends`, held the
+  lock from 00:15:21 to 00:17:23, then requested suspend, and `PM: suspend
+  entry` followed at 00:17:41.
+- **Not changed:** the unmount timeout quirk. Two of the three cycles waited
+  15.01 s for `umount` to exit 124 even though the mount table was already
+  empty; the third took 0.00 s. The hook proceeds either way (C44), but every
+  such sleep starts about 15 s later than it needs to.
+
+**Not measured.** A cycle in which all three re-suspend attempts wake early;
+none has happened.
+
+**Where.** Nothing was changed. The evidence is boot 0's journal
+(`resume:`/`resuspend:`/`thunderbolt:`/`ens9`/`cifs:` lines),
+`mbp-sleep report --boot 0`, `~/.local/state/Vorta/log/vorta.log` and
+`/var/log/borg-backup.log`.
+
+**Undo.** None: this entry changes nothing.
+
+**Worked.** Yes, for the two claims it was written to settle: `thunderbolt_eject`
+followed by re-authorisation leaves the adapter working after multi-day sleeps,
+and `resuspend` still returns the machine to sleep with the adapter attached.
