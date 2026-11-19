@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-11-19
+
+### Changed
+
+- **No program change. 0.1.3 records what the long sleeps measured.** Three
+  entries in `docs/config-changes.md` close the open questions of 0.1.2: C43c
+  (the self-wake re-suspend held on four long sleeps), C46d (the C46 revert
+  produces no catch-up and no notification, at the cost of no backup at all
+  while the machine sleeps through every hourly boundary) and C43d (with the
+  Thunderbolt adapter attached, 61 hours asleep, the adapter restored itself
+  after both wakes and no cycle reached 3/3 re-suspend attempts). `mbp-sleep`,
+  `install.sh` and `macbook.conf` are byte-identical to 0.1.2, so the machine
+  needs no reinstall.
+
+### Fixed
+
+- Nothing. This release exists so the verification has a version to point at.
+
 ## [0.1.2] - 2026-10-26
 
 ### Added
